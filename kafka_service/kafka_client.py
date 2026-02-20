@@ -3,15 +3,19 @@ import logging
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 import time
+import msgspec 
+from uuid import UUID
 
 class Client:
     def __init__(self, service_name, topics_to_watch):
+
         self.service_name = service_name
         self.bootstrap_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
         
         self.producer = self._split_second_retry(
             lambda: KafkaProducer(
                 bootstrap_servers=self.bootstrap_servers,
+                value_serializer=lambda v: msgspec.json.encode(v),  
                 # Standard practice: retry sending messages automatically
                 retries=5 
             )
@@ -25,6 +29,8 @@ class Client:
             enable_auto_commit=True
         )
 
+        print("Kafka client started and subscribed to topics: ",topics_to_watch)
+
     def _split_second_retry(self, func):
         """Prevents crash if Kafka is still booting up in Docker."""
         for i in range(10):
@@ -34,4 +40,5 @@ class Client:
                 logging.warning(f"Waiting for Kafka... attempt {i+1}")
                 time.sleep(2)
         raise ConnectionError("Could not connect to Kafka after 20 seconds.")
+
 

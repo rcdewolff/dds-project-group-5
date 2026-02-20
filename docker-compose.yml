@@ -1,6 +1,4 @@
-# version: "3" - Removed because apparently it is obsolete
 services:
-
   gateway:
     image: nginx:1.25-bookworm
     volumes:
@@ -14,14 +12,19 @@ services:
 
   order-service:
     build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./kafka_service:/home/flask-app/kafka_service
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
+      - env/kafka_settings.env
     depends_on:
       - order-db
+      - kafka
 
   order-db:
     image: redis:7.2-bookworm
@@ -29,12 +32,17 @@ services:
 
   stock-service:
     build: ./stock
+    volumes:
+      - ./stock:/home/flask-app/
+      - ./kafka_service:/home/flask-app/kafka_service
     image: stock:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
+      - env/kafka_settings.env
     depends_on:
       - stock-db
+      - kafka
 
   stock-db:
     image: redis:7.2-bookworm
@@ -42,18 +50,21 @@ services:
 
   payment-service:
     build: ./payment
-    image: user:latest
+    volumes:
+      - ./payment:/home/flask-app/
+      - ./kafka_service:/home/flask-app/kafka_service
+    image: payment:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
+      - env/kafka_settings.env
     depends_on:
       - payment-db
+      - kafka
 
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
-
-
 
   kafka:
     image: apache/kafka:latest
@@ -61,17 +72,17 @@ services:
     ports:
       - "9092:9092"
     environment:
-      # Use KRaft mode instead of Zookeeper
       KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: 'broker,controller'
-      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@localhost:9093'
-      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://localhost:9092'
-      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT'
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
     volumes:
       - kafka_data:/var/lib/kafka/data
-
 
 volumes:
   kafka_data:
