@@ -3,9 +3,11 @@ import os
 import atexit
 import uuid
 
-import redis
+import psycopg
+from psycopg_pool import ConnectionPool
+from psycopg.rows import dict_row
 
-from msgspec import msgpack, Struct
+from msgspec import Struct
 from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
@@ -13,16 +15,43 @@ DB_ERROR_STR = "DB error"
 
 app = Flask("payment-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+# Create connection pool
+conn_params = {
+    'host': os.environ['POSTGRES_HOST'],
+    'port': int(os.environ['POSTGRES_PORT']),
+    'user': os.environ['POSTGRES_USER'],
+    'password': os.environ['POSTGRES_PASSWORD'],
+    'dbname': os.environ['POSTGRES_DB']
+}
+
+db_pool = ConnectionPool(
+    conninfo=f"host={conn_params['host']} port={conn_params['port']} "
+             f"user={conn_params['user']} password={conn_params['password']} "
+             f"dbname={conn_params['dbname']}",
+    min_size=1,
+    max_size=10
+)
+
+
+def init_db():
+    """Initialize database table"""
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    credit INTEGER NOT NULL
+                )
+            """)
+            conn.commit()
 
 
 def close_db_connection():
-    db.close()
+    db_pool.close()
 
 
+# Initialize database on startup
+init_db()
 atexit.register(close_db_connection)
 
 
@@ -32,25 +61,34 @@ class UserValue(Struct):
 
 def get_user_from_db(user_id: str) -> UserValue | None:
     try:
-        # get serialized data
-        entry: bytes = db.get(user_id)
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT credit FROM users WHERE user_id = %s",
+                    (user_id,)
+                )
+                row = cur.fetchone()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
-    if entry is None:
-        # if user does not exist in the database; abort
+    
+    if row is None:
         abort(400, f"User: {user_id} not found!")
-    return entry
+    
+    return UserValue(credit=row['credit'])
 
 
 @app.post('/create_user')
 def create_user():
     key = str(uuid.uuid4())
-    value = msgpack.encode(UserValue(credit=0))
     try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (user_id, credit) VALUES (%s, %s)",
+                    (key, 0)
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
 
@@ -59,11 +97,17 @@ def create_user():
 def batch_init_users(n: int, starting_money: int):
     n = int(n)
     starting_money = int(starting_money)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
-                                  for i in range(n)}
+    
+    values = [(f"{i}", starting_money) for i in range(n)]
     try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO users (user_id, credit) VALUES (%s, %s)",
+                    values
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"})
 
@@ -82,11 +126,17 @@ def find_user(user_id: str):
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
     user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
+    # update credit
     user_entry.credit += int(amount)
     try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET credit = %s WHERE user_id = %s",
+                    (user_entry.credit, user_id)
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
@@ -95,13 +145,19 @@ def add_credit(user_id: str, amount: int):
 def remove_credit(user_id: str, amount: int):
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
     user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
+    # update credit
     user_entry.credit -= int(amount)
     if user_entry.credit < 0:
         abort(400, f"User: {user_id} credit cannot get reduced below zero!")
     try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET credit = %s WHERE user_id = %s",
+                    (user_entry.credit, user_id)
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 

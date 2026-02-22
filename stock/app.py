@@ -3,9 +3,11 @@ import os
 import atexit
 import uuid
 
-import redis
+import psycopg
+from psycopg_pool import ConnectionPool
+from psycopg.rows import dict_row
 
-from msgspec import msgpack, Struct
+from msgspec import Struct
 from flask import Flask, jsonify, abort, Response
 
 
@@ -13,16 +15,44 @@ DB_ERROR_STR = "DB error"
 
 app = Flask("stock-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+# Create connection pool
+conn_params = {
+    'host': os.environ['POSTGRES_HOST'],
+    'port': int(os.environ['POSTGRES_PORT']),
+    'user': os.environ['POSTGRES_USER'],
+    'password': os.environ['POSTGRES_PASSWORD'],
+    'dbname': os.environ['POSTGRES_DB']
+}
+
+db_pool = ConnectionPool(
+    conninfo=f"host={conn_params['host']} port={conn_params['port']} "
+             f"user={conn_params['user']} password={conn_params['password']} "
+             f"dbname={conn_params['dbname']}",
+    min_size=1,
+    max_size=10
+)
+
+
+def init_db():
+    """Initialize database table"""
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS items (
+                    item_id TEXT PRIMARY KEY,
+                    stock INTEGER NOT NULL,
+                    price INTEGER NOT NULL
+                )
+            """)
+            conn.commit()
 
 
 def close_db_connection():
-    db.close()
+    db_pool.close()
 
 
+# Initialize database on startup
+init_db()
 atexit.register(close_db_connection)
 
 
@@ -32,27 +62,36 @@ class StockValue(Struct):
 
 
 def get_item_from_db(item_id: str) -> StockValue | None:
-    # get serialized data
     try:
-        entry: bytes = db.get(item_id)
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT stock, price FROM items WHERE item_id = %s",
+                    (item_id,)
+                )
+                row = cur.fetchone()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
-    if entry is None:
-        # if item does not exist in the database; abort
+    
+    if row is None:
         abort(400, f"Item: {item_id} not found!")
-    return entry
+    
+    return StockValue(stock=row['stock'], price=row['price'])
 
 
 @app.post('/item/create/<price>')
 def create_item(price: int):
     key = str(uuid.uuid4())
     app.logger.debug(f"Item: {key} created")
-    value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO items (item_id, stock, price) VALUES (%s, %s, %s)",
+                    (key, 0, int(price))
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
 
@@ -62,11 +101,17 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
     n = int(n)
     starting_stock = int(starting_stock)
     item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-                                  for i in range(n)}
+    
+    values = [(f"{i}", starting_stock, item_price) for i in range(n)]
     try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO items (item_id, stock, price) VALUES (%s, %s, %s)",
+                    values
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
 
@@ -85,11 +130,17 @@ def find_item(item_id: str):
 @app.post('/add/<item_id>/<amount>')
 def add_stock(item_id: str, amount: int):
     item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
+    # update stock
     item_entry.stock += int(amount)
     try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE items SET stock = %s WHERE item_id = %s",
+                    (item_entry.stock, item_id)
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
@@ -97,14 +148,20 @@ def add_stock(item_id: str, amount: int):
 @app.post('/subtract/<item_id>/<amount>')
 def remove_stock(item_id: str, amount: int):
     item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
+    # update stock
     item_entry.stock -= int(amount)
     app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
     if item_entry.stock < 0:
         abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
     try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE items SET stock = %s WHERE item_id = %s",
+                    (item_entry.stock, item_id)
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
