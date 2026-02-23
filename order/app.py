@@ -11,7 +11,7 @@ from psycopg.rows import dict_row
 import requests
 
 import json
-from msgspec import json as msgjson, Struct
+from msgspec import Struct
 from flask import Flask, jsonify, abort, Response
 
 
