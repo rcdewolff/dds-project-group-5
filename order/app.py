@@ -9,11 +9,13 @@ import psycopg
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 import requests
-
+import threading
 import json
 from msgspec import Struct
 from flask import Flask, jsonify, abort, Response
-
+from kafka_service import kafka_client, kafka_event
+from msgspec import msgpack, Struct
+from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -21,6 +23,23 @@ REQ_ERROR_STR = "Requests error"
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
 app = Flask("order-service")
+service_name = "order"
+order_kafka = kafka_client.Client(
+    service_name, 
+    [f'{service_name}.request']
+)
+kafka_producer, kafka_consumer = order_kafka.producer, order_kafka.consumer
+
+
+def consume_messages():
+    """Background task to process Kafka messages."""
+    print("Kafka consumer started...")
+    for message in kafka_consumer:
+        print(f"Received message on topic {message.topic}: {message.value}") 
+
+
+
+
 
 # Create connection pool
 conn_params = {
@@ -36,8 +55,12 @@ db_pool = ConnectionPool(
              f"user={conn_params['user']} password={conn_params['password']} "
              f"dbname={conn_params['dbname']}",
     min_size=1,
-    max_size=10
+    max_size=10,
+    # Reconnection policy
+    reconnect_timeout=30,
+    kwargs={"connect_timeout": 10}
 )
+
 
 
 def init_db():
@@ -53,7 +76,8 @@ def init_db():
                     total_cost INTEGER NOT NULL
                 )
             """)
-            conn.commit()
+            # conn.commit()
+
 
 
 def close_db_connection():
@@ -107,7 +131,7 @@ def create_order(user_id: str):
                     "INSERT INTO orders (order_id, paid, items, user_id, total_cost) VALUES (%s, %s, %s, %s, %s)",
                     (key, False, json.dumps([]), user_id, 0)
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
@@ -139,7 +163,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
                     "INSERT INTO orders (order_id, paid, items, user_id, total_cost) VALUES (%s, %s, %s, %s, %s)",
                     values
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
@@ -158,6 +182,18 @@ def find_order(order_id: str):
         }
     )
 
+
+@app.get("/test/<service>")
+def test_kafka(service: str):
+    test_msg = "TEST"
+    print(f"Order service testing kafka on {service}...")
+    kafka_producer.send(
+        topic = f'{service}.request',
+        value=test_msg
+    )
+    return jsonify({
+        "message":test_msg
+    })
 
 def send_post_request(url: str):
     try:
@@ -179,6 +215,7 @@ def send_get_request(url: str):
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
+
     order_entry: OrderValue = get_order_from_db(order_id)
     item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
@@ -198,11 +235,38 @@ def add_item(order_id: str, item_id: str, quantity: int):
                     "UPDATE orders SET items = %s, total_cost = %s WHERE order_id = %s",
                     (json.dumps(items_json), order_entry.total_cost, order_id)
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
                     status=200)
+
+
+@app.post('/addItem/<order_id>/<item_id>/<quantity>')
+def add_item_kafka(order_id: str, item_id: str, quantity: int):
+    
+    order_entry: OrderValue = get_order_from_db(order_id)
+    # TODO Check if there are enough elements in stock
+
+    order_entry.items.append((item_id, int(quantity)))
+    order_entry.total_cost += int(quantity) * item_json["price"]
+    
+    # Convert items to JSON format for storage
+    items_json = [{'item_id': item[0], 'quantity': item[1]} for item in order_entry.items]
+    
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE orders SET items = %s, total_cost = %s WHERE order_id = %s",
+                    (json.dumps(items_json), order_entry.total_cost, order_id)
+                )
+                # conn.commit()
+    except psycopg.Error:
+        return abort(400, DB_ERROR_STR)
+    return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
+                    status=200)
+
 
 
 def rollback_stock(removed_items: list[tuple[str, int]]):

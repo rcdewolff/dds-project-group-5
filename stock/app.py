@@ -10,10 +10,29 @@ from psycopg.rows import dict_row
 from msgspec import Struct
 from flask import Flask, jsonify, abort, Response
 
+import threading
+from flask import Flask, jsonify, abort, Response
+from kafka_service import kafka_client, kafka_event
 
 DB_ERROR_STR = "DB error"
 
-app = Flask("stock-service")
+app = Flask("payment-service")
+service_name = "stock"
+
+order_kafka = kafka_client.Client(
+    service_name, 
+    [f'{service_name}.request']
+)
+kafka_producer, kafka_consumer = order_kafka.producer, order_kafka.consumer
+
+
+def consume_messages():
+    """Background task to process Kafka messages."""
+    print("Kafka consumer started...")
+    for message in kafka_consumer:
+        print(f"Received message on topic {message.topic}: {message.value}") 
+
+
 
 # Create connection pool
 conn_params = {
@@ -29,10 +48,14 @@ db_pool = ConnectionPool(
              f"user={conn_params['user']} password={conn_params['password']} "
              f"dbname={conn_params['dbname']}",
     min_size=1,
-    max_size=10
+    max_size=10,
+    # Reconnection policy
+    reconnect_timeout=30,
+    kwargs={"connect_timeout": 10}
 )
 
 
+# TODO Abstract DB connection in an external class
 def init_db():
     """Initialize database table"""
     with db_pool.connection() as conn:
@@ -44,8 +67,7 @@ def init_db():
                     price INTEGER NOT NULL
                 )
             """)
-            conn.commit()
-
+            # conn.commit()
 
 def close_db_connection():
     db_pool.close()
@@ -90,7 +112,7 @@ def create_item(price: int):
                     "INSERT INTO items (item_id, stock, price) VALUES (%s, %s, %s)",
                     (key, 0, int(price))
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
@@ -110,7 +132,7 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
                     "INSERT INTO items (item_id, stock, price) VALUES (%s, %s, %s)",
                     values
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
@@ -139,7 +161,7 @@ def add_stock(item_id: str, amount: int):
                     "UPDATE items SET stock = %s WHERE item_id = %s",
                     (item_entry.stock, item_id)
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
@@ -160,7 +182,7 @@ def remove_stock(item_id: str, amount: int):
                     "UPDATE items SET stock = %s WHERE item_id = %s",
                     (item_entry.stock, item_id)
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)

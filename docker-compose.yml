@@ -18,18 +18,19 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app  
     env_file:
       - env/order_citus.env
       - env/kafka_settings.env
     depends_on:
-      kafka:
-        condition: service_healthy
+      # kafka:
+      #   condition: service_healthy
       order-citus-db:
         condition: service_healthy
 
   order-citus-db:
     image: citusdata/citus:13.0
+    command: postgres -c ssl=off
     environment:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_USER=postgres
@@ -52,15 +53,15 @@ services:
       - ./stock:/home/flask-app/
       - ./kafka_service:/home/flask-app/kafka_service
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     env_file:
       - env/stock_citus.env
       - env/kafka_settings.env
     depends_on:
       stock-citus-db:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
+      # kafka:
+      #   condition: service_healthy
       
   stock-citus-db:
     image: citusdata/citus:13.0
@@ -68,6 +69,7 @@ services:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_USER=postgres
       - POSTGRES_DB=stocks
+    command: postgres -c ssl=off
     ports:
       - "5433:5432"
     deploy:
@@ -86,13 +88,13 @@ services:
       - ./payment:/home/flask-app/
       - ./kafka_service:/home/flask-app/kafka_service
     image: payment:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     env_file:
       - env/payment_citus.env
       - env/kafka_settings.env
     depends_on:
-      kafka:
-        condition: service_healthy
+      # kafka:
+      #   condition: service_healthy
       payment-citus-db:
         condition: service_healthy
 
@@ -103,6 +105,7 @@ services:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_USER=postgres
       - POSTGRES_DB=payments
+    command: postgres -c ssl=off
     ports:
       - "5434:5432"
     deploy:
@@ -116,6 +119,12 @@ services:
       retries: 5
   kafka:
     image: apache/kafka:latest
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     container_name: kafka
     ports:
       - "9092:9092"

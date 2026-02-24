@@ -2,18 +2,33 @@ import logging
 import os
 import atexit
 import uuid
-
 import psycopg
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
-
+import threading
 from msgspec import Struct
 from flask import Flask, jsonify, abort, Response
-
+from kafka_service import kafka_client, kafka_event
 DB_ERROR_STR = "DB error"
 
 
 app = Flask("payment-service")
+service_name = "payment"
+order_kafka = kafka_client.Client(
+    service_name, 
+    [f'{service_name}.request']
+)
+kafka_producer, kafka_consumer = order_kafka.producer, order_kafka.consumer
+
+
+def consume_messages():
+    """Background task to process Kafka messages."""
+    print("Kafka consumer started...")
+    for message in kafka_consumer:
+        print(f"Received message on topic {message.topic}: {message.value}") 
+
+
+
 
 # Create connection pool
 conn_params = {
@@ -29,7 +44,10 @@ db_pool = ConnectionPool(
              f"user={conn_params['user']} password={conn_params['password']} "
              f"dbname={conn_params['dbname']}",
     min_size=1,
-    max_size=10
+    max_size=10,
+    # Reconnection policy
+    reconnect_timeout=30,
+    kwargs={"connect_timeout": 10}
 )
 
 
@@ -43,8 +61,7 @@ def init_db():
                     credit INTEGER NOT NULL
                 )
             """)
-            conn.commit()
-
+            # conn.commit()
 
 def close_db_connection():
     db_pool.close()
@@ -87,7 +104,7 @@ def create_user():
                     "INSERT INTO users (user_id, credit) VALUES (%s, %s)",
                     (key, 0)
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
@@ -106,7 +123,7 @@ def batch_init_users(n: int, starting_money: int):
                     "INSERT INTO users (user_id, credit) VALUES (%s, %s)",
                     values
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"})
@@ -135,7 +152,7 @@ def add_credit(user_id: str, amount: int):
                     "UPDATE users SET credit = %s WHERE user_id = %s",
                     (user_entry.credit, user_id)
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
@@ -156,7 +173,7 @@ def remove_credit(user_id: str, amount: int):
                     "UPDATE users SET credit = %s WHERE user_id = %s",
                     (user_entry.credit, user_id)
                 )
-                conn.commit()
+                # conn.commit()
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
