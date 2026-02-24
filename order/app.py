@@ -5,10 +5,13 @@ import random
 import uuid
 from collections import defaultdict
 
-import redis
+import psycopg
+from psycopg_pool import ConnectionPool
+from psycopg.rows import dict_row
 import requests
 
-from msgspec import msgpack, Struct
+import json
+from msgspec import Struct
 from flask import Flask, jsonify, abort, Response
 
 
@@ -19,16 +22,46 @@ GATEWAY_URL = os.environ['GATEWAY_URL']
 
 app = Flask("order-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+# Create connection pool
+conn_params = {
+    'host': os.environ['POSTGRES_HOST'],
+    'port': int(os.environ['POSTGRES_PORT']),
+    'user': os.environ['POSTGRES_USER'],
+    'password': os.environ['POSTGRES_PASSWORD'],
+    'dbname': os.environ['POSTGRES_DB']
+}
+
+db_pool = ConnectionPool(
+    conninfo=f"host={conn_params['host']} port={conn_params['port']} "
+             f"user={conn_params['user']} password={conn_params['password']} "
+             f"dbname={conn_params['dbname']}",
+    min_size=1,
+    max_size=10
+)
+
+
+def init_db():
+    """Initialize database table"""
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    order_id TEXT PRIMARY KEY,
+                    paid BOOLEAN NOT NULL,
+                    items JSONB NOT NULL,
+                    user_id TEXT NOT NULL,
+                    total_cost INTEGER NOT NULL
+                )
+            """)
+            conn.commit()
 
 
 def close_db_connection():
-    db.close()
+    db_pool.close()
 
 
+# Initialize database on startup
+init_db()
 atexit.register(close_db_connection)
 
 
@@ -41,25 +74,41 @@ class OrderValue(Struct):
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
-        # get serialized data
-        entry: bytes = db.get(order_id)
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT paid, items, user_id, total_cost FROM orders WHERE order_id = %s",
+                    (order_id,)
+                )
+                row = cur.fetchone()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
-    if entry is None:
-        # if order does not exist in the database; abort
+    
+    if row is None:
         abort(400, f"Order: {order_id} not found!")
-    return entry
+    
+    # Convert items from JSON to list of tuples
+    items = [(item['item_id'], item['quantity']) for item in row['items']]
+    return OrderValue(
+        paid=row['paid'],
+        items=items,
+        user_id=row['user_id'],
+        total_cost=row['total_cost']
+    )
 
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
     key = str(uuid.uuid4())
-    value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO orders (order_id, paid, items, user_id, total_cost) VALUES (%s, %s, %s, %s, %s)",
+                    (key, False, json.dumps([]), user_id, 0)
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
@@ -72,21 +121,26 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     n_users = int(n_users)
     item_price = int(item_price)
 
-    def generate_entry() -> OrderValue:
+    def generate_entry(order_id: int):
         user_id = random.randint(0, n_users - 1)
         item1_id = random.randint(0, n_items - 1)
         item2_id = random.randint(0, n_items - 1)
-        value = OrderValue(paid=False,
-                           items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
-                           user_id=f"{user_id}",
-                           total_cost=2*item_price)
-        return value
+        items = [
+            {'item_id': f"{item1_id}", 'quantity': 1},
+            {'item_id': f"{item2_id}", 'quantity': 1}
+        ]
+        return (f"{order_id}", False, json.dumps(items), f"{user_id}", 2*item_price)
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
-                                  for i in range(n)}
     try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                values = [generate_entry(i) for i in range(n)]
+                cur.executemany(
+                    "INSERT INTO orders (order_id, paid, items, user_id, total_cost) VALUES (%s, %s, %s, %s, %s)",
+                    values
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
@@ -133,9 +187,19 @@ def add_item(order_id: str, item_id: str, quantity: int):
     item_json: dict = item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
+    
+    # Convert items to JSON format for storage
+    items_json = [{'item_id': item[0], 'quantity': item[1]} for item in order_entry.items]
+    
     try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE orders SET items = %s, total_cost = %s WHERE order_id = %s",
+                    (json.dumps(items_json), order_entry.total_cost, order_id)
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
                     status=200)
@@ -171,8 +235,14 @@ def checkout(order_id: str):
         abort(400, "User out of credit")
     order_entry.paid = True
     try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE orders SET paid = %s WHERE order_id = %s",
+                    (order_entry.paid, order_id)
+                )
+                conn.commit()
+    except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)
