@@ -6,27 +6,18 @@ import psycopg
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 import threading
-from msgspec import Struct
+from msgspec import Struct, json
 from flask import Flask, jsonify, abort, Response
-from kafka_service import kafka_client, kafka_event
+from services import utils
+
+
 DB_ERROR_STR = "DB error"
 
 
 app = Flask("payment-service")
 service_name = "payment"
-order_kafka = kafka_client.Client(
-    service_name, 
-    [f'{service_name}.request']
-)
-kafka_producer, kafka_consumer = order_kafka.producer, order_kafka.consumer
-
-
-def consume_messages():
-    """Background task to process Kafka messages."""
-    print("Kafka consumer started...")
-    for message in kafka_consumer:
-        print(f"Received message on topic {message.topic}: {message.value}") 
-
+kafka_producer = None
+kafka_consumer = None
 
 
 
@@ -49,6 +40,27 @@ db_pool = ConnectionPool(
     reconnect_timeout=30,
     kwargs={"connect_timeout": 10}
 )
+
+
+def consume_messages(consumer):
+    """Background task to process Kafka messages."""
+    if consumer is None:
+        print("Consumer is None, exiting thread.")
+        return
+    
+    print("Kafka consumer started...")
+    for message in consumer:
+        
+        event = json.decode(
+            message.value, 
+            type=utils.BaseEvent
+        )
+
+        print(f"Received message on topic {message.topic}: {event.event_type}") 
+        handle_event(event)
+
+def handle_event(event: utils.BaseEvent):
+    pass
 
 
 def init_db():
@@ -174,6 +186,36 @@ def remove_credit(user_id: str, amount: int):
                     (user_entry.credit, user_id)
                 )
                 # conn.commit()
+    except psycopg.Error:
+        return abort(400, DB_ERROR_STR)
+    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+
+def remove_user_credit(user_id: str, amount: int):
+    app.logger.debug(f"Removing {amount} credit from user: {user_id}")
+    user_entry: UserValue = get_user_from_db(user_id)
+    # update credit
+    user_entry.credit -= int(amount)
+    if user_entry.credit < 0:
+        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE users 
+                    SET credit = credit - %s 
+                    WHERE user_id = %s 
+                    AND credit - %s >= 0
+                    RETURNING credit;",
+                    """,
+                    (user_entry.credit, user_id)
+                )
+                result = cur.fetchone()
+                if result is None:
+                    return False
+                return True
+
+        
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)

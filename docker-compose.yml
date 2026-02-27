@@ -9,15 +9,17 @@ services:
       - order-service
       - stock-service
       - payment-service
+    
 
   order-service:
     build: ./order
     volumes:
       - ./order:/home/flask-app/
-      - ./kafka_service:/home/flask-app/kafka_service
+      - ./services:/home/flask-app/services
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - PYTHONUNBUFFERED=1
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app  
     env_file:
       - env/order_citus.env
@@ -49,9 +51,11 @@ services:
 
   stock-service:
     build: ./stock
+    environment:
+      - PYTHONUNBUFFERED=1
     volumes:
       - ./stock:/home/flask-app/
-      - ./kafka_service:/home/flask-app/kafka_service
+      - ./services:/home/flask-app/services
     image: stock:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     env_file:
@@ -86,9 +90,11 @@ services:
     build: ./payment
     volumes:
       - ./payment:/home/flask-app/
-      - ./kafka_service:/home/flask-app/kafka_service
+      - ./services:/home/flask-app/services
     image: payment:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
+    environment:
+      - PYTHONUNBUFFERED=1
     env_file:
       - env/payment_citus.env
       - env/kafka_settings.env

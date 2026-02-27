@@ -59,6 +59,10 @@ def find_order(order_id: str) -> dict:
 def checkout_order(order_id: str) -> requests.Response:
     return requests.post(f"{ORDER_URL}/orders/checkout/{order_id}")
 
+def order_test(message: str) -> requests.Response:
+    return requests.get(f"{ORDER_URL}/orders/test/{message}")
+
+
 
 ########################################################################################################################
 #   STATUS CHECKS
@@ -69,3 +73,8 @@ def status_code_is_success(status_code: int) -> bool:
 
 def status_code_is_failure(status_code: int) -> bool:
     return 400 <= status_code < 500
+
+
+
+if __name__ == '__main__':
+    order_test("Test message")
