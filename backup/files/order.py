@@ -31,7 +31,9 @@ order_kafka = kafka_client.Client(
 )
 kafka_producer, kafka_consumer = order_kafka.producer, order_kafka.consumer
 
-#Database Pool
+# ---------------------------------------------------------------------------
+# DB pool
+# ---------------------------------------------------------------------------
 
 db_pool = ConnectionPool(
     conninfo=(
@@ -49,6 +51,29 @@ db_pool = ConnectionPool(
 
 event_consumer = EventConsumer(kafka_consumer, db_pool, service_name)
 coordinator    = TwoPhaseCommitCoordinator(db_pool, timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# Side-effect handlers
+# ---------------------------------------------------------------------------
+
+@event_consumer.on("CHECKOUT_SUCCESS")
+def on_checkout_success(event: BaseEvent) -> None:
+    order_id = event.payload.get("order_id")
+    user_id  = event.payload.get("user_id")
+    app.logger.info("NOTIFY: user=%s order=%s confirmed", user_id, order_id)
+    # TODO: plug in email / push notification
+
+
+@event_consumer.on("ORDER_FAILED")
+def on_order_failed(event: BaseEvent) -> None:
+    app.logger.warning("NOTIFY: checkout failed order=%s reason=%s",
+                       event.payload.get("order_id"), event.payload.get("reason"))
+
+
+@event_consumer.on("PAYMENT_PROCESSED")
+def on_payment_processed(event: BaseEvent) -> None:
+    app.logger.info("Payment confirmed for order=%s", event.payload.get("order_id"))
 
 
 # ---------------------------------------------------------------------------
@@ -96,9 +121,12 @@ def close_db_connection():
 
 init_db()
 atexit.register(close_db_connection)
-def consume_messages():
-    event_consumer._run()
+event_consumer.start()
 
+
+# ---------------------------------------------------------------------------
+# Domain model
+# ---------------------------------------------------------------------------
 
 class OrderValue(Struct):
     paid: bool
@@ -125,6 +153,9 @@ def get_order_from_db(order_id: str) -> OrderValue:
                       user_id=row['user_id'], total_cost=row['total_cost'])
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
@@ -275,5 +306,3 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    logging.root.handlers = gunicorn_logger.handlers
-    logging.root.setLevel(gunicorn_logger.level)

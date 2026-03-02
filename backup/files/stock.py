@@ -25,8 +25,9 @@ order_kafka = kafka_client.Client(
 )
 kafka_producer, kafka_consumer = order_kafka.producer, order_kafka.consumer
 
-
+# ---------------------------------------------------------------------------
 # DB pool
+# ---------------------------------------------------------------------------
 
 db_pool = ConnectionPool(
     conninfo=(
@@ -44,8 +45,26 @@ db_pool = ConnectionPool(
 
 event_consumer = EventConsumer(kafka_consumer, db_pool, service_name)
 
-# DB initalization
 
+# ---------------------------------------------------------------------------
+# Side-effect handlers
+# ---------------------------------------------------------------------------
+
+@event_consumer.on("CHECKOUT_SUCCESS")
+def on_checkout_success(event: BaseEvent) -> None:
+    app.logger.info("STOCK: 2PC commit confirmed for order=%s",
+                    event.payload.get("order_id"))
+
+
+@event_consumer.on("ORDER_FAILED")
+def on_order_failed(event: BaseEvent) -> None:
+    app.logger.info("STOCK: reservation released for order=%s",
+                    event.payload.get("order_id"))
+
+
+# ---------------------------------------------------------------------------
+# DB init
+# ---------------------------------------------------------------------------
 
 def init_db():
     with db_pool.connection() as conn:
@@ -96,11 +115,12 @@ def close_db_connection():
 
 init_db()
 atexit.register(close_db_connection)
-def consume_messages():
-    event_consumer._run()
+event_consumer.start()
 
 
-
+# ---------------------------------------------------------------------------
+# Domain model
+# ---------------------------------------------------------------------------
 
 class StockValue(Struct):
     stock: int
@@ -120,7 +140,9 @@ def get_item_from_db(item_id: str) -> StockValue:
     return StockValue(stock=row['stock'], price=row['price'])
 
 
-
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.post('/item/create/<price>')
 def create_item(price: int):
@@ -203,7 +225,9 @@ def remove_stock(item_id: str, amount: int):
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 
-#2PC Endpoints
+# ---------------------------------------------------------------------------
+# 2PC endpoints
+# ---------------------------------------------------------------------------
 
 @app.post('/prepare/<transaction_id>')
 def prepare_stock(transaction_id: str):
@@ -284,5 +308,3 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    logging.root.handlers = gunicorn_logger.handlers
-    logging.root.setLevel(gunicorn_logger.level)
