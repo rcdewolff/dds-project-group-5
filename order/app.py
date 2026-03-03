@@ -5,7 +5,7 @@ import random
 from typing import Dict
 import uuid
 from collections import defaultdict
-
+from redis import pubsub    
 import psycopg
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
@@ -17,7 +17,7 @@ import threading
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
-SAGA_TIMEOUT_SECONDS = 20.0
+SAGA_TIMEOUT_SECONDS = 30.0
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
@@ -40,6 +40,8 @@ conn_params = {
     'dbname': os.environ['POSTGRES_DB']
 }
 
+
+
 db_pool = ConnectionPool(
     conninfo=f"host={conn_params['host']} port={conn_params['port']} "
              f"user={conn_params['user']} password={conn_params['password']} "
@@ -52,18 +54,22 @@ db_pool = ConnectionPool(
 )
 
 
-
 def consume_messages(consumer):
     """Background task to process Kafka messages."""
     print("Kafka consumer started...")
     for message in consumer:
-        print(f"Received message on topic {message.topic}: {message.value}") 
-        event = json.decode(
-            message.value, 
-            type=utils.BaseEvent
-        )
+        result = utils.decode_and_type_event(message)
+        if isinstance(result, utils.Failure):
+            print(f"Failed to decode message: {result.error}")
+            # TODO Handle validation error response
 
+            continue
+            
+        event = result.value
+        print(f"Received message on topic {message.topic}: {event.event_type}.") 
         handle_event(event)
+
+
 
 def init_db():
     """Initialize database table"""
@@ -83,12 +89,13 @@ def init_db():
 
 
 def log_event(event: utils.BaseEvent) -> bool:
+    pass
     # Event json to be stored
     event_details = json.encode(event)
 
     query = """
         INSERT INTO log (idempotency_key, event_type, details) 
-        VALUES (%s,%s,%s)
+        VALUES (%s,%s::jsonb,%s)
         """
     
     with db_pool.connection() as conn:
@@ -143,12 +150,13 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
     key = str(uuid.uuid4())
+    empty_items = []
     try:
         with db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO orders (order_id, paid, items, user_id, total_cost) VALUES (%s, %s, %s, %s, %s)",
-                    (key, False, json.encode(list()), user_id, 0)
+                    "INSERT INTO orders (order_id, paid, items, user_id, total_cost) VALUES (%s, %s, %s::jsonb, %s, %s)",
+                    (key, False, empty_items, user_id, 0)
                 )
                 # conn.commit()
     except psycopg.Error:
@@ -294,81 +302,42 @@ def send_get_request(url: str):
         return response
 
 
-# TODO Improve naming
-# def handle_stock_ok(event: utils.BaseEvent):
-#     """
-#         Handler for the kafka message that notifies that the item is valid and can 
-#         be add to the order.
-
-#         NOTE:
-#         I don't know how to handle responses since we are async.
-#     """
-#     # TODO if the response event is negative
-#     if event.event_type == "STOCK_ITEM_INVALID":
-
-#     item_json: dict = item_reply.json()
-#     order_entry.items.append((item_id, int(quantity)))
-#     order_entry.total_cost += int(quantity) * item_json["price"]
-
-#      # Convert items to JSON format for storage
-#     items_json = [{'item_id': item[0], 'quantity': item[1]} for item in order_entry.items]
-    
-#     try:
-#         with db_pool.connection() as conn:
-#             with conn.cursor() as cur:
-#                 cur.execute(
-#                     "UPDATE orders SET items = %s, total_cost = %s WHERE order_id = %s",
-#                     (json.dumps(items_json), order_entry.total_cost, order_id)
-#                 )
-#                 # conn.commit()
-
-@app.post('/addItem/<order_id>/<item_id>/<quantity>')
+@app.post('/addItem/<order_id>/<item_id>/<int:quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
-
+    app.logger.info(f"item: {item_id} quantity: {quantity} order: {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
     
     # Convert items to JSON format for storage
     items_json = [{'item_id': item[0], 'quantity': item[1]} for item in order_entry.items]
-    
+    items_json.append({'item_id': item_id, 'quantity': quantity})
+    serialized_items = json.encode(items_json).decode()
     try:
         with db_pool.connection() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    "UPDATE orders SET items = %s, total_cost = %s WHERE order_id = %s",
-                    (json.encode(items_json), order_entry.total_cost, order_id)
+                    "UPDATE orders SET items = %s::jsonb, total_cost = %s WHERE order_id = %s",
+                    (serialized_items, order_entry.total_cost, order_id)
                 )
                 # conn.commit()
-    except psycopg.Error:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-                    status=200)
+    except psycopg.Error as e:
+        # .exception() automatically includes the traceback
+        app.logger.exception(f"Database error while updating order {order_id}")
+        
+        # Or print specific details if you prefer a single line:
+        # app.logger.error(f"SQL Error: {e.pgcode} - {e}")
+        
+        return abort(400, f"Database error: {str(e)}")
 
+    items_as_dicts = [
+        {"item_id": item[0], "quantity": item[1]} 
+        for item in order_entry.items
+    ]
 
-@app.post('/addItem/<order_id>/<item_id>/<quantity>')
-def add_item_kafka(order_id: str, item_id: str, quantity: int):
-    
-    order_entry: OrderValue = get_order_from_db(order_id)
-    # TODO Check if there are enough elements in stock
-
-    order_entry.items.append((item_id, int(quantity)))
-    order_entry.total_cost += int(quantity) * item_json["price"]
-    
-    # Convert items to JSON format for storage
-    items_json = [{'item_id': item[0], 'quantity': item[1]} for item in order_entry.items]
-    
-    try:
-        with db_pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE orders SET items = %s, total_cost = %s WHERE order_id = %s",
-                    (json.encode(items_json), order_entry.total_cost, order_id)
-                )
-                # conn.commit()
-    except psycopg.Error:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-                    status=200)
-
+    return jsonify({
+        "order_id": order_id,
+        "items": items_as_dicts, # Now a list of dicts
+        "user_id": order_entry.user_id
+    }),200
 
 
 def rollback_stock(removed_items: list[tuple[str, int]]):
@@ -385,15 +354,20 @@ def checkout(order_id: str):
     order_value: OrderValue = get_order_from_db(order_id)
     items_list = [(item_id, qty) for item_id, qty in order_value.items]
 
-    payload = utils.OrderCheckoutPayload(order_id=order_id,items=items_list)
-
+    if not items_list:
+        return abort(400, f"Order: {order_id} has no items!")
+    
+    
+    # TODO Add the internal event CHECKOUT_INITIATED in the next version.
+    #   This is a command event that should follow an internal event CHECKOUT_INITIATED.
     event = utils.BaseEvent.create(
-        event_type="CHECKOUT_INITIATED",
-        payload=payload
+        event_type=utils.Commands.RESERVE_STOCK,
+        payload= utils.ReserveStockCommandPayload(
+            order_id=order_id,
+            items=items_list
+        )
     )
-
-    # Register the pending saga BEFORE sending to Kafka
-    # to avoid a race where the response arrives before we're listening
+    app.logger.info(f"Initiating checkout for order: {order_id} with items: {len(items_list)}")  
     wait_event = threading.Event()
     with _pending_sagas_lock:
         _pending_sagas[event.correlation_id] = {
@@ -409,7 +383,7 @@ def checkout(order_id: str):
 
     with _pending_sagas_lock:
         saga_entry = _pending_sagas.pop(event.correlation_id, None)
-
+    print(f"Saga completed with result: {saga_entry['result'] if saga_entry else None}")
     if not completed or saga_entry is None:
         return {
             "status": "timeout",
@@ -419,7 +393,7 @@ def checkout(order_id: str):
         }, 504
 
     result = saga_entry["result"]
-
+    
     if result["status"] == "success":
         return {
             "status": "success",
@@ -443,44 +417,65 @@ def handle_event(event: utils.BaseEvent):
     correlation_id = event.correlation_id
 
     if event_type == utils.StockIntegrationEvent.STOCK_ALLOCATED:
-        print("Stock reservation success.")
+        # log success message
+        app.logger.info("Stock reservation success.")
+
         # _resolve_saga(correlation_id, {"status": "success"})
-        _trigger_payment(correlation_id=correlation_id, order_id=event.payload.order_id)
+        payload: utils.StockReservedPayload = event.payload
+        trigger_payment(
+            correlation_id=correlation_id, 
+            order_id=payload.order_id,
+            amount=payload.amount
+        )
 
     elif event_type == utils.StockIntegrationEvent.STOCK_UNAVAILABLE:
+        app.logger.info("Stock reservation failed.")
+        
         # TODO send 404 back
         _resolve_saga(correlation_id, {
             "status": "failed",
             "reason": "Stock failure: not enough items"
         })
+
     
     elif event_type == utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED:
+        app.logger.info("Payment success.")
         _resolve_saga(correlation_id, {
-            "status":"success"
+            "status":"success",
+            "result": {
+                "remaining_credit": event.payload.remaining_credit
+            }
         })
 
-    elif event_type == utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED:
+    elif event_type == utils.PaymentIntegrationEvent.PAYMENT_FAILED:
+        app.logger.info(f"Payment failed for reason: {event.payload.reason}")
         # TODO implement rollback logic
         _resolve_saga(correlation_id, {
             "status": "failed",
-            "reason": "Payment failure: Not enough credit"
+            "reason": event.payload.reason
         })
 
 
 
-def _trigger_payment(correlation_id: str, order_id: str, price: float):
+def trigger_payment(correlation_id: str, order_id: str, amount: int):
     """
         Triggered after the stock has been reserved.
     """
+    order_value: OrderValue = get_order_from_db(order_id)
+
     event = utils.BaseEvent(
         event_type=utils.Commands.START_PAYMENT,
         correlation_id=correlation_id,
-        payload=utils.PaymentCheckoutPayload(
+        payload=utils.StartPaymentCommandPayload(
             order_id=order_id,
-            price=price
+            user_id=order_value.user_id,
+            amount=amount
         )
     )
-    pass
+    kafka_producer.send(
+        topic='payment.request',
+        value=event
+    )
 
 
 def _resolve_saga(correlation_id: str, result: dict):

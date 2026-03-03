@@ -44,23 +44,66 @@ db_pool = ConnectionPool(
 
 def consume_messages(consumer):
     """Background task to process Kafka messages."""
-    if consumer is None:
-        print("Consumer is None, exiting thread.")
-        return
-    
     print("Kafka consumer started...")
     for message in consumer:
-        
-        event = json.decode(
-            message.value, 
-            type=utils.BaseEvent
+        result = utils.decode_and_type_event(message)
+        if isinstance(result, utils.Failure):
+            print(f"Failed to decode message: {result.error}")
+            # TODO Handle validation error response
+
+            continue
+            
+        event = result.value
+        print(f"Received message on topic {message.topic}: {event.event_type}.") 
+        handle_checkout(event)
+
+
+def dispatch_event(event: utils.BaseEvent):
+    if event.event_type == utils.Commands.START_PAYMENT:
+        handle_checkout(event)
+    else:
+        print(f"Unknown event type: {event.event_type}")
+
+
+def handle_checkout(event: utils.BaseEvent):
+    # Create Query
+    result = remove_user_credit(event.payload.user_id, event.payload.amount)
+    # print(f"Payment processing result for user: {event.payload.user_id}, order: {event.payload.order_id}: {result}")
+    # If valid, emit valid event
+    if isinstance(result, utils.Success):
+        new_event = utils.BaseEvent(
+            event_type=utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED,
+            payload=utils.PaymentProcessedPayload(
+                order_id=event.payload.order_id,
+                user_id=event.payload.user_id,
+                amount=event.payload.amount,
+                remaining_credit= result.value
+            ),
+            correlation_id=event.correlation_id
         )
 
-        print(f"Received message on topic {message.topic}: {event.event_type}") 
-        handle_event(event)
+        kafka_producer.send(
+            topic="order.request",
+            value=new_event
+        )
+    
+    else: 
+        new_event = utils.BaseEvent(
+            event_type=utils.PaymentIntegrationEvent.PAYMENT_FAILED,
+            payload=utils.PaymentFailedPayload(
+                order_id=event.payload.order_id,
+                user_id=event.payload.user_id,
+                amount=event.payload.amount,
+                reason=result.error
+            ),
+            correlation_id=event.correlation_id
+        )
+        kafka_producer.send(
+            topic="order.request",
+            value=new_event
+        )
 
-def handle_event(event: utils.BaseEvent):
-    pass
+
 
 
 def init_db():
@@ -190,13 +233,18 @@ def remove_credit(user_id: str, amount: int):
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
-def remove_user_credit(user_id: str, amount: int):
+
+
+def remove_user_credit(user_id: str, amount: int) -> utils.CreditResult:
+
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
     user_entry: UserValue = get_user_from_db(user_id)
-    # update credit
+    # TODO maybe this is useless since we have the check in the DB query, 
+    #   but it is good to have this check here as well to avoid unnecessary DB calls
     user_entry.credit -= int(amount)
     if user_entry.credit < 0:
-        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
+        return utils.Failure("Insufficient credit")
+
     try:
         with db_pool.connection() as conn:
             with conn.cursor() as cur:
@@ -206,19 +254,35 @@ def remove_user_credit(user_id: str, amount: int):
                     SET credit = credit - %s 
                     WHERE user_id = %s 
                     AND credit - %s >= 0
-                    RETURNING credit;",
+                    RETURNING credit
                     """,
-                    (user_entry.credit, user_id)
+                    (amount, user_id, amount)
                 )
                 result = cur.fetchone()
                 if result is None:
-                    return False
-                return True
+                    # This happens if the 'AND credit >= %s' check fails
+                    app.logger.info(f"User: {user_id} has insufficient credit for amount: {amount}")
+                    return utils.Failure("Insufficient credit")
+                
+                app.logger.info(f"User: {user_id} credit updated to: {result[0]}")
+                return utils.Success(result[0])
 
         
+    except psycopg.Error as e:
+        app.logger.error(f"Database error: {e}")
+        return utils.Failure(DB_ERROR_STR)
+    
+
+@app.get('/users')
+def get_users():
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT user_id, credit FROM users")
+                rows = cur.fetchall()
+                return jsonify(rows)
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
 if __name__ == '__main__':

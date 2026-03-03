@@ -7,12 +7,12 @@ import psycopg
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 
-from msgspec import Struct, json
+from msgspec import Struct, ValidationError, convert, json
 from flask import Flask, jsonify, abort, Response
 
 import threading
 from flask import Flask, jsonify, abort, Response
-from services import kafka_client, utils
+from services import utils
 
 DB_ERROR_STR = "DB error"
 
@@ -22,27 +22,77 @@ service_name = "stock"
 kafka_producer = None
 kafka_consumer = None
 
+
 def consume_messages(consumer):
     """Background task to process Kafka messages."""
     print("Kafka consumer started...")
     for message in consumer:
-        event = json.decode(
-            message.value, 
-            type=utils.BaseEvent
-        )
+        result = utils.decode_and_type_event(message)
+        if isinstance(result, utils.Failure):
+            print(f"Failed to decode message: {result.error}")
+            # TODO Handle validation error response
+
+            continue
+            
+        event = result.value
+        print(f"Received message on topic {message.topic}: {event.event_type}.") 
+        dispatch_event(event)
+            
         
-        print(f"Received message on topic {event.event_type}: {event.payload}") 
-        if event.event_type == 'CHECKOUT_INITIATED':
-            payload = event.payload
-            response = utils.BaseEvent(
-                utils.StockIntegrationEvent.STOCK_ALLOCATED,
-                correlation_id=event.correlation_id,
-                payload=utils.StockUpdatePayload("1",10)
+
+
+def dispatch_event(event: utils.BaseEvent):
+
+    if event.event_type == utils.Commands.RESERVE_STOCK:
+        handle_stock_reservation(event)
+    elif event.event_type == utils.Commands.FREE_STOCK:
+        handle_rollback(event)
+
+
+
+
+def handle_stock_reservation(event: utils.BaseEvent):
+   
+    payload = event.payload
+    print(f"Handling stock reservation for order: {payload.order_id} with items: {payload.items}")
+
+    result = subtract_stock_batch(payload.order_id, payload.items, event.correlation_id)
+    
+    if isinstance(result, utils.Success):
+        print(f"Stock successfully reserved for order: {payload.order_id}")
+        event = utils.BaseEvent(
+            utils.StockIntegrationEvent.STOCK_ALLOCATED,
+            correlation_id=event.correlation_id,
+            payload=utils.StockReservedPayload(
+                order_id=payload.order_id,
+                amount=result.value
             )
+        )
 
-            kafka_producer.send('order.request',response)
-            # subtract_stock_batch(payload.order_id, payload.items, message.correlation_id)
+        kafka_producer.send(
+            topic='order.request',
+            value=event)
 
+    else:
+        print(f"Failed to reserve stock for order: {payload.order_id}. Reason: {result.error}")
+        event = utils.BaseEvent(
+            utils.StockIntegrationEvent.STOCK_UNAVAILABLE,
+            correlation_id=event.correlation_id,
+            # TODO Add more info in the payload about the failure (e.g. which items were unavailable)
+            payload=utils.StockReservedPayload(
+                order_id=payload.order_id,
+                amount=0
+            )
+        )
+
+        kafka_producer.send(
+            topic='order.request',
+            value=event
+        )
+    
+
+def handle_rollback(event: utils.BaseEvent):
+    pass
 
 def checkout():
     # Query for all the needed items
@@ -123,14 +173,14 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str,int]],event_id: st
     
     # Extract lists for the query
     if not items:
-        return False
+        return utils.Failure("No items to reserve")
 
     # zip(*items) turns [(a, b), (c, d)] into [(a, c), (b, d)]
     item_ids, quantities = zip(*items)
     item_ids, quantities = list(item_ids), list(quantities)
 
     # Common table expression to First prepare all the queries an then execute them at the same time.
-    query = """
+    query_old = """
         -- 1. Create a temporary virtual table 
         WITH items_to_update AS (
             -- unnest turns the item_ids and quantities arrays into a table with two columns
@@ -162,32 +212,63 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str,int]],event_id: st
         )
 
         -- 4. Log the event ID to ensure this order isn't processed twice (Idempotency)
-        INSERT INTO processed_events (event_id, order_id)
+        -- INSERT INTO processed_events (event_id, order_id)
         -- We select from a dummy query that only returns a row if the previous step succeeded
-        SELECT %s, %s
+        --SELECT %s, %s
         -- This check ensures that if 'do_update' failed (due to stock), no event log is created
-        WHERE (SELECT COUNT(*) FROM do_update) = %s
+        --WHERE (SELECT COUNT(*) FROM do_update) = %s
         -- If this succeeds, the function returns a value; if it fails, it returns nothing
         RETURNING 1;
     """
-
+    query = """
+    WITH 
+    items_to_update AS (
+        -- 1. Create a virtual table of the requested IDs and quantities
+        SELECT unnest(%s::text[]) as id, unnest(%s::int[]) as req_qty),
+    availability_check AS (
+        -- 2. Lock and verify that EVERY item has enough stock
+        SELECT i.item_id, i.price, u.req_qty
+        FROM items i
+        JOIN items_to_update u ON i.item_id = u.id
+        WHERE i.stock >= u.req_qty
+        FOR UPDATE 
+    ),
+    do_update AS (
+        -- 3. Perform the subtraction
+        UPDATE items i
+        SET stock = i.stock - u.req_qty
+        FROM items_to_update u
+        WHERE i.item_id = u.id
+        -- Only run if the number of available items matches the request count
+        AND (SELECT COUNT(*) FROM availability_check) = %s 
+        -- Return the price and quantity for each row actually changed
+        RETURNING i.price, u.req_qty
+    )
+    -- 4. Calculate the total cost of the items updated
+    SELECT COALESCE(SUM(price * req_qty), 0) FROM do_update;
+    """
+    
+    params = (item_ids, quantities, len(item_ids))
+    
     try:
         with db_pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (item_ids, quantities, len(item_ids), event_id, order_id, len(item_ids)))
-                result = cur.fetchone() # used to verify the RETURN 1 condition
+                cur.execute(query, params)
+                result = cur.fetchone()
+                total_cost = result[0] if result else 0
                 
-                if result:
-                    print("QUERY COMPLETED.")
+                if total_cost > 0:
                     conn.commit()
-                    return True  # Success: Stock subtracted and event recorded
+                    return utils.Success(total_cost)
                 else:
-                    print("QUERY FAILED.")
+                    # If COALESCE returned 0, it means the UPDATE didn't run
                     conn.rollback()
-                    return False # Failure: Insufficient stock or already processed
-    # TODO modify this
-    except psycopg.Error:
-        return abort(400, "Database error during stock subtraction")
+                    return utils.Failure("Insufficient stock")
+                    
+    except psycopg.Error as e:
+        # Logging the actual error helps debugging
+        app.logger.error(f"Stock subtraction failed: {e}")
+        return utils.Failure("Database error during stock subtraction")
 
 
 @app.post('/item/create/<price>')
@@ -209,16 +290,15 @@ def create_item(price: int):
 
 @app.get('/items')
 def get_items():
-    item_ids = []
     with db_pool.connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                    SELECT * FROM items
+                    SELECT item_id, stock, price FROM items
                 """)
-            item_ids = cur.fetchall()
+            items = cur.fetchall()
+            return jsonify(items)
     
-    return {"items":item_ids},200
 
 @app.post('/batch_init/<n>/<starting_stock>/<item_price>')
 def batch_init_users(n: int, starting_stock: int, item_price: int):
