@@ -8,7 +8,8 @@ def on_starting(server):
 def post_fork(server, worker):
     import threading
     from services import kafka_client
-    import app    
+    import app  
+    app.db_pool = app.init_db_pool()
     # Reinitialize kafka client fresh in each worker
     order_kafka = kafka_client.Client(app.service_name, [f'{app.service_name}.request'])
     app.kafka_producer = order_kafka.producer

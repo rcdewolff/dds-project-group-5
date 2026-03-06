@@ -4,4 +4,5 @@ gunicorn==21.2.0
 msgspec==0.18.6
 requests==2.31.0
 confluent_kafka==2.13.0
+redis==7.2.1
 kafka-python==2.2.15

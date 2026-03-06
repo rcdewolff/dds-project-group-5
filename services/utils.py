@@ -183,6 +183,8 @@ PAYLOAD_REGISTRY: dict[str, type] = {
 
 DecodeResult = Union[Success[BaseEvent[Any]], Failure[str]]
 
+
+
 def decode_and_type_event(record: Any) -> DecodeResult:
     """
     Decodes a raw Kafka message into a specific BaseEvent[PayloadStruct].
@@ -191,9 +193,7 @@ def decode_and_type_event(record: Any) -> DecodeResult:
     try:
 
         raw_bytes = record.value
-        if not raw_bytes:
-            return Failure("Received empty message value (Tombstone)")
-        
+        print(f"Decoding raw bytes: {raw_bytes}")
         # Decode the envelope with a dict payload
         envelope = json.decode(raw_bytes, type=BaseEvent[dict])
         
@@ -201,7 +201,7 @@ def decode_and_type_event(record: Any) -> DecodeResult:
         payload_cls = PAYLOAD_REGISTRY.get(envelope.event_type)
         if not payload_cls:
             print(f"Event decoding: unknown event type: {envelope.event_type}")
-            return Failure(error=f"Unknown event type: {envelope.event_type}")
+            return Failure(error=f"UNKNOWN_EVENT_TYPE:{envelope.event_type}")
 
         # Convert dict to specific Struct
         typed_payload = convert(envelope.payload, payload_cls)
@@ -222,3 +222,11 @@ def decode_and_type_event(record: Any) -> DecodeResult:
     except Exception as e:
         print(f"Decoding error: {e}")
         return Failure(error=f"Decoding error: {e}")
+    
+
+class RedisMessageWrapper:
+    """
+    A wrapper for Redis messages to ensure consistent handling of byte strings.
+    """
+    def __init__(self, data):
+        self.value = data.encode() if isinstance(data, str) else data

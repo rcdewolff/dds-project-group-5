@@ -21,7 +21,6 @@ kafka_consumer = None
 
 
 
-# Create connection pool
 conn_params = {
     'host': os.environ['POSTGRES_HOST'],
     'port': int(os.environ['POSTGRES_PORT']),
@@ -30,16 +29,21 @@ conn_params = {
     'dbname': os.environ['POSTGRES_DB']
 }
 
-db_pool = ConnectionPool(
-    conninfo=f"host={conn_params['host']} port={conn_params['port']} "
-             f"user={conn_params['user']} password={conn_params['password']} "
-             f"dbname={conn_params['dbname']}",
-    min_size=1,
-    max_size=10,
-    # Reconnection policy
-    reconnect_timeout=30,
-    kwargs={"connect_timeout": 10}
-)
+db_pool: ConnectionPool = None
+
+def init_db_pool():
+        
+    return ConnectionPool(
+        conninfo=f"host={conn_params['host']} port={conn_params['port']} "
+                f"user={conn_params['user']} password={conn_params['password']} "
+                f"dbname={conn_params['dbname']}",
+        min_size=1,
+        max_size=10,
+        # Reconnection policy
+        reconnect_timeout=30,
+        kwargs={"connect_timeout": 10}
+    )
+
 
 
 def consume_messages(consumer):
@@ -108,7 +112,8 @@ def handle_checkout(event: utils.BaseEvent):
 
 def init_db():
     """Initialize database table"""
-    with db_pool.connection() as conn:
+    tmp_pool = init_db_pool()
+    with tmp_pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -117,6 +122,7 @@ def init_db():
                 )
             """)
             # conn.commit()
+    tmp_pool.close()
 
 def close_db_connection():
     db_pool.close()

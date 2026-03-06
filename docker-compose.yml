@@ -9,8 +9,23 @@ services:
       - order-service
       - stock-service
       - payment-service
-    
 
+  # ---------------------------------------------------------------------------
+  # Redis — shared signal bus for all saga pub/sub across services
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Order Service
+  # ---------------------------------------------------------------------------
   order-service:
     build: ./order
     volumes:
@@ -20,14 +35,40 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - PYTHONUNBUFFERED=1
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app  
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     env_file:
       - env/order_citus.env
       - env/kafka_settings.env
     depends_on:
-      # kafka:
-      #   condition: service_healthy
       order-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  order-consumer:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    command: python consumer.py
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   order-citus-db:
@@ -49,10 +90,15 @@ services:
       timeout: 5s
       retries: 5
 
+  # ---------------------------------------------------------------------------
+  # Stock Service
+  # ---------------------------------------------------------------------------
   stock-service:
     build: ./stock
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     volumes:
       - ./stock:/home/flask-app/
       - ./services:/home/flask-app/services
@@ -64,9 +110,12 @@ services:
     depends_on:
       stock-citus-db:
         condition: service_healthy
-      # kafka:
-      #   condition: service_healthy
-      
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  
   stock-citus-db:
     image: citusdata/citus:13.0
     environment:
@@ -86,6 +135,9 @@ services:
       timeout: 5s
       retries: 5
 
+  # ---------------------------------------------------------------------------
+  # Payment Service
+  # ---------------------------------------------------------------------------
   payment-service:
     build: ./payment
     volumes:
@@ -95,16 +147,18 @@ services:
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     env_file:
       - env/payment_citus.env
       - env/kafka_settings.env
     depends_on:
-      # kafka:
-      #   condition: service_healthy
       payment-citus-db:
         condition: service_healthy
-
-
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
   payment-citus-db:
     image: citusdata/citus:13.0
     environment:
@@ -123,13 +177,17 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Kafka
+  # ---------------------------------------------------------------------------
   kafka:
     image: apache/kafka:latest
     healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 10
       start_period: 30s
     container_name: kafka
     ports:
