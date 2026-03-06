@@ -1,3 +1,5 @@
+from urllib import response
+
 import requests
 
 ORDER_URL = STOCK_URL = PAYMENT_URL = "http://127.0.0.1:8000"
@@ -80,28 +82,37 @@ def status_code_is_failure(status_code: int) -> bool:
 
 
 
-def setup_test_environment(n: int):
-    # Create 2 users for testing
-    user_ids = []
-    item_ids = []
+def setup_test_environment(items: list[int], credit: int) -> str:
+    # Create a user and an associated order
+    user_response = create_user()
+    user_id = user_response["user_id"]
+    add_credit_to_user(user_id, credit)
+    print(f"Created user with ID: {user_id}")
 
-    for _ in range(n):
-        user_response = create_user()
-        user_ids.append(user_response["user_id"])
+    order_response = create_order(user_id=user_id)
+    order_id = order_response["order_id"]
+    print(f"Created order with ID: {order_id}")
 
-    # Add some credit to the users
-    for user_id in user_ids:
-        add_credit_to_user(user_id, 1000)
-    
-    # Add some items
-    for i in range(n):
-        item_response = create_item(10 + i * 5)
-        item_ids.append(item_response["item_id"])
+    # Create items and add them to the stock, then add them to the order
+    for i in range(len(items)):
+        item_response = create_item(price=items[i]*10)
+        item_id = item_response["item_id"]
+        print(f"Created item with ID: {item_id}")
+        # Add stock for the item
+        add_stock(item_id, items[i])
 
-    # Add some stock
-    for item_id in item_ids:
-        add_stock(item_id, 1000)
+        # Add the item to the order
+        response = add_item_to_order(order_id, item_id, 2)
+        print(f"Add item response status code: {response}")
 
+
+    # Retrieve the order details to verify the item was added
+    order_details = find_order(order_id)
+    print(f"Order details after adding item: {order_details}")
+    if order_details["items"] is None:
+        print("No items in order details.")
+        return ""
+    return order_id
 
 def print_test_data() -> None:
     
@@ -177,6 +188,20 @@ def test_add_item_to_order():
     print(f"Order details after adding item: {order_details}")
     # Check if the item_id is in the order details
    
+
+
+
+def test_saga_failure():
+    order_id = setup_test_environment(items=[1, 2], credit=10)
+    if order_id != "":
+        print("Test environment setup successfully.")
+    else:
+        print("Failed to set up test environment.")
+        return
+    
+    checkout_order_response = checkout_order(order_id)
+    print(f"Checkout response status code: {checkout_order_response.status_code}")
+    
 
 if __name__ == '__main__':
     # setup_test_environment(2)

@@ -84,7 +84,7 @@ class StockUnavailablePayload(Struct):
     Payload for a stock unavailable event.
     """
     order_id: str
-    items: list[tuple[str,int]]
+    # out_of_stock_items: list[tuple[str,int]]
 
 
 class StockReservedPayload(Struct):
@@ -93,6 +93,13 @@ class StockReservedPayload(Struct):
     """
     order_id: str
     amount: int
+
+
+class StockFreedPayload(Struct):
+    """
+    Payload for a stock freed event.
+    """
+    order_id: str
 
 
 class PaymentProcessedPayload(Struct):
@@ -167,14 +174,20 @@ class StockIntegrationEvent(StrEnum):
     # Sent to Order service after stock is successfully subtracted
     STOCK_ALLOCATED = "integration.stock.allocated"
     STOCK_UNAVAILABLE = "integration.stock.unavailable"
+    STOCK_FAILED = "integration.stock.failed"
+    STOCK_FREED = "integration.stock.freed"
 
 
 
 
 
 PAYLOAD_REGISTRY: dict[str, type] = {
+
     Commands.RESERVE_STOCK: OrderCheckoutPayload,
+    Commands.FREE_STOCK: OrderCheckoutPayload,
+
     Commands.START_PAYMENT: StartPaymentCommandPayload,
+
     StockIntegrationEvent.STOCK_ALLOCATED: StockReservedPayload,
     StockIntegrationEvent.STOCK_UNAVAILABLE: StockUnavailablePayload,
     PaymentIntegrationEvent.PAYMENT_SUCCEEDED: PaymentProcessedPayload,

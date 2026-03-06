@@ -30,8 +30,16 @@ def consume_messages(consumer):
         result = utils.decode_and_type_event(message)
         if isinstance(result, utils.Failure):
             print(f"Failed to decode message: {result.error}")
-            # TODO Handle validation error response
-
+            # TODO Handle validation error response in a decent way
+            # event = utils.BaseEvent(
+            #     event_type=utils.StockIntegrationEvent.STOCK_FAILED,
+            #     correlation_id=None,
+            #     payload=None
+            # )
+            # kafka_producer.send(
+            #     topic='order.request',
+            #     value=event
+            # ) 
             continue
             
         event = result.value
@@ -79,9 +87,8 @@ def handle_stock_reservation(event: utils.BaseEvent):
             utils.StockIntegrationEvent.STOCK_UNAVAILABLE,
             correlation_id=event.correlation_id,
             # TODO Add more info in the payload about the failure (e.g. which items were unavailable)
-            payload=utils.StockReservedPayload(
-                order_id=payload.order_id,
-                amount=0
+            payload=utils.StockUnavailablePayload(
+                order_id=payload.order_id
             )
         )
 
@@ -92,7 +99,35 @@ def handle_stock_reservation(event: utils.BaseEvent):
     
 
 def handle_rollback(event: utils.BaseEvent):
-    pass
+    
+    order_id = event.payload.order_id
+    print(f"Handling stock rollback for order: {order_id}")
+    items = event.payload.items
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            for item_id, qty in items:
+                cur.execute(
+                    "UPDATE items SET stock = stock + %s WHERE item_id = %s",
+                    (qty, item_id)
+                )
+        conn.commit()
+    print(f"Stock rollback completed for order: {order_id}")
+
+    event = utils.BaseEvent(
+        utils.StockIntegrationEvent.STOCK_FREED,
+        correlation_id=event.correlation_id,
+        payload=utils.StockFreedPayload(
+            order_id=order_id
+        )
+    )
+
+    kafka_producer.send(
+        topic='order.request',
+        value=event
+    )
+
+
+
 
 def checkout():
     # Query for all the needed items
@@ -172,109 +207,93 @@ def get_item_from_db(item_id: str) -> StockValue | None:
     
     return StockValue(stock=row['stock'], price=row['price'])
 
+def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: str):
+    # items looks like: [(<item_id1>,<qty1>), (<item_id2>,<qty2>)]
 
-def subtract_stock_batch(order_id: str, items: list[tuple[str,int]],event_id: str):
-    # items looks like: [(<item_id1>,<qty1>),(<item_id1>,<qty1>)]
-    
-    # Extract lists for the query
     if not items:
         return utils.Failure("No items to reserve")
 
-    # zip(*items) turns [(a, b), (c, d)] into [(a, c), (b, d)]
     item_ids, quantities = zip(*items)
     item_ids, quantities = list(item_ids), list(quantities)
 
-    # Common table expression to First prepare all the queries an then execute them at the same time.
-    query_old = """
-        -- 1. Create a temporary virtual table 
-        WITH items_to_update AS (
-            -- unnest turns the item_ids and quantities arrays into a table with two columns
-            SELECT unnest(%s::text[]) as id, unnest(%s::int[]) as req_qty
-        ),
-
-        -- 2. Verify availability and lock the rows
-        availability_check AS (
-            SELECT i.item_id
-            FROM items i
-            JOIN items_to_update u ON i.item_id = u.id
-            -- Only select rows where current stock is enough for the requested quantity
-            WHERE i.stock >= u.req_qty
-            -- FOR UPDATE locks these rows; other transactions must wait until we COMMIT or ROLLBACK
-            FOR UPDATE 
-        ),
-
-        -- 3. Perform the subtraction only if the check passed for EVERY item
-        do_update AS (
-            UPDATE items i
-            SET stock = i.stock - u.req_qty
-            FROM items_to_update u
-            WHERE i.item_id = u.id
-            -- This subquery ensures the update runs ONLY if the number of available items
-            -- found in Step 2 matches the total number of items the user requested
-            AND (SELECT COUNT(*) FROM availability_check) = %s 
-            -- RETURNING allows us to know exactly which rows were modified
-            RETURNING i.item_id
-        )
-
-        -- 4. Log the event ID to ensure this order isn't processed twice (Idempotency)
-        -- INSERT INTO processed_events (event_id, order_id)
-        -- We select from a dummy query that only returns a row if the previous step succeeded
-        --SELECT %s, %s
-        -- This check ensures that if 'do_update' failed (due to stock), no event log is created
-        --WHERE (SELECT COUNT(*) FROM do_update) = %s
-        -- If this succeeds, the function returns a value; if it fails, it returns nothing
-        RETURNING 1;
-    """
+    # TODO might be required to add missing items check
     query = """
-    WITH 
+    WITH
     items_to_update AS (
         -- 1. Create a virtual table of the requested IDs and quantities
-        SELECT unnest(%s::text[]) as id, unnest(%s::int[]) as req_qty),
+        SELECT unnest(%s::text[]) as id, unnest(%s::int[]) as req_qty
+    ),
     availability_check AS (
-        -- 2. Lock and verify that EVERY item has enough stock
-        SELECT i.item_id, i.price, u.req_qty
+        -- 2. Lock and verify stock — tag each row as available or not
+        SELECT
+            i.item_id,
+            i.price,
+            u.req_qty,
+            i.stock >= u.req_qty AS is_available
         FROM items i
         JOIN items_to_update u ON i.item_id = u.id
-        WHERE i.stock >= u.req_qty
-        FOR UPDATE 
+        FOR UPDATE
     ),
     do_update AS (
-        -- 3. Perform the subtraction
+        -- 3. Perform subtraction ONLY if every item is available
         UPDATE items i
-        SET stock = i.stock - u.req_qty
-        FROM items_to_update u
-        WHERE i.item_id = u.id
-        -- Only run if the number of available items matches the request count
-        AND (SELECT COUNT(*) FROM availability_check) = %s 
-        -- Return the price and quantity for each row actually changed
-        RETURNING i.price, u.req_qty
+        SET stock = i.stock - a.req_qty
+        FROM availability_check a
+        WHERE i.item_id = a.item_id
+        AND (SELECT COUNT(*) FROM availability_check WHERE NOT is_available) = 0
+        RETURNING i.item_id, a.price, a.req_qty
     )
-    -- 4. Calculate the total cost of the items updated
-    SELECT COALESCE(SUM(price * req_qty), 0) FROM do_update;
+    -- 4. Return two result sets in one query:
+    --    - updated rows with their cost (do_update)
+    --    - unavailable item_ids for failure reporting (availability_check)
+    SELECT
+        'updated'       AS result_type,
+        item_id,
+        price,
+        req_qty,
+        NULL            AS unavailable_item_id
+    FROM do_update
+
+    UNION ALL
+
+    SELECT
+        'unavailable'   AS result_type,
+        NULL,
+        NULL,
+        NULL,
+        item_id         AS unavailable_item_id
+    FROM availability_check
+    WHERE NOT is_available;
     """
-    
-    params = (item_ids, quantities, len(item_ids))
-    
+
+    params = (item_ids, quantities)
+
     try:
         with db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
-                result = cur.fetchone()
-                total_cost = result[0] if result else 0
-                
-                if total_cost > 0:
-                    conn.commit()
-                    return utils.Success(total_cost)
-                else:
-                    # If COALESCE returned 0, it means the UPDATE didn't run
+                rows = cur.fetchall()
+
+                updated_rows = [(r[1], r[2], r[3]) for r in rows if r[0] == 'updated']
+                unavailable_ids = [r[4] for r in rows if r[0] == 'unavailable']
+
+                if unavailable_ids:
+                    # At least one item lacked stock — nothing was updated (guard in do_update)
                     conn.rollback()
-                    return utils.Failure("Insufficient stock")
-                    
+                    return utils.Failure(f"Insufficient stock for items: {unavailable_ids}")
+
+                if not updated_rows:
+                    # No unavailable items but also nothing updated — unexpected state
+                    conn.rollback()
+                    return utils.Failure("No items were updated")
+
+                total_cost = sum(price * qty for _, price, qty in updated_rows)
+                conn.commit()
+                return utils.Success(total_cost)
+
     except psycopg.Error as e:
-        # Logging the actual error helps debugging
         app.logger.error(f"Stock subtraction failed: {e}")
         return utils.Failure("Database error during stock subtraction")
-
 
 @app.post('/item/create/<price>')
 def create_item(price: int):
