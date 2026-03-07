@@ -18,6 +18,9 @@ from kafka_service.kafka_event import BaseEvent, CheckoutPayload
 from kafka_service.consumer_handler import EventConsumer
 
 DB_ERROR_STR = "DB error"
+GATEWAY_URL = os.environ.get('GATEWAY_URL', '')
+RECOVERY_INTERVAL_SECS = 60
+STALE_THRESHOLD_SECS = 120
 
 app = Flask("payment-service")
 service_name = "payment"
