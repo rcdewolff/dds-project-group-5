@@ -217,13 +217,22 @@ def prepare_stock(transaction_id: str):
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 for item in items:
-                    cur.execute("SELECT stock FROM items WHERE item_id = %s", (item['item_id'],))
+                    cur.execute("SELECT stock FROM items WHERE item_id = %s FOR UPDATE", (item['item_id'],))
                     row = cur.fetchone()
                     if row is None:
                         abort(400, f"Item {item['item_id']} not found")
-                    if row['stock'] < int(item['quantity']):
-                        abort(400, f"Insufficient stock for {item['item_id']}")
+                    stock = row['stock']
 
+                    cur.execute("""
+                        SELECT COALESCE(SUM(sr.quantity), 0) as reserved
+                        FROM stock_reservations sr
+                        JOIN stock_transactions st ON sr.transaction_id = st.transaction_id
+                        WHERE sr.item_id = %s AND st.status = 'PREPARED'
+                    """, (item['item_id'],))
+                    reserved = cur.fetchone()['reserved']
+
+                    if stock - reserved < int(item['quantity']):
+                        abort(400, f"Insufficient stock for {item['item_id']}")
                 cur.execute(
                     "INSERT INTO stock_transactions (transaction_id, order_id, status, items_reserved) VALUES (%s, %s, %s, %s)",
                     (transaction_id, order_id, 'PREPARED', json.dumps(items))
@@ -254,7 +263,8 @@ def commit_stock(transaction_id: str):
                             (transaction_id,))
                 for res in cur.fetchall():
                     cur.execute("UPDATE items SET stock = stock - %s WHERE item_id = %s",
-                                (res['quantity'], res['item_id']))
+                                (res['quantity'], res['item_id']))               
+                cur.execute("DELETE FROM stock_reservations WHERE transaction_id = %s", (transaction_id,))
                 cur.execute("UPDATE stock_transactions SET status = 'COMMITTED' WHERE transaction_id = %s",
                             (transaction_id,))
                 conn.commit()
@@ -276,6 +286,113 @@ def abort_stock(transaction_id: str):
         return jsonify({'status': 'ABORTED', 'transaction_id': transaction_id}), 200
     except psycopg.Error as e:
         abort(400, f"DB error in abort: {str(e)}")
+
+
+# ── Cooperative Termination: expose local tx status ──
+
+@app.get('/transaction/<transaction_id>/status')
+def transaction_status(transaction_id: str):
+    """Other participants can query this to resolve uncertain transactions."""
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT status FROM stock_transactions WHERE transaction_id = %s",
+                            (transaction_id,))
+                row = cur.fetchone()
+                if row:
+                    return jsonify({'transaction_id': transaction_id, 'status': row['status']}), 200
+                return jsonify({'transaction_id': transaction_id, 'status': 'UNKNOWN'}), 200
+    except psycopg.Error:
+        return jsonify({'transaction_id': transaction_id, 'status': 'UNKNOWN'}), 200
+
+
+# ── Stale Transaction Recovery Sweep ──
+
+def _recovery_commit(transaction_id: str) -> None:
+    """Apply a commit for a stale PREPARED transaction."""
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT status FROM stock_transactions WHERE transaction_id = %s",
+                            (transaction_id,))
+                tx = cur.fetchone()
+                if tx is None or tx['status'] != 'PREPARED':
+                    return
+                cur.execute("SELECT item_id, quantity FROM stock_reservations WHERE transaction_id = %s",
+                            (transaction_id,))
+                for res in cur.fetchall():
+                    cur.execute("UPDATE items SET stock = stock - %s WHERE item_id = %s",
+                                (res['quantity'], res['item_id']))
+                cur.execute("DELETE FROM stock_reservations WHERE transaction_id = %s", (transaction_id,))
+                cur.execute("UPDATE stock_transactions SET status = 'COMMITTED' WHERE transaction_id = %s",
+                            (transaction_id,))
+                conn.commit()
+        logging.info("RECOVERY committed  tx=%s", transaction_id)
+    except psycopg.Error as exc:
+        logging.error("RECOVERY commit error  tx=%s  exc=%s", transaction_id, exc)
+
+
+def _recovery_abort(transaction_id: str) -> None:
+    """Abort a stale PREPARED transaction."""
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM stock_reservations WHERE transaction_id = %s",
+                            (transaction_id,))
+                cur.execute("UPDATE stock_transactions SET status = 'ABORTED' WHERE transaction_id = %s",
+                            (transaction_id,))
+                conn.commit()
+        logging.info("RECOVERY aborted  tx=%s", transaction_id)
+    except psycopg.Error as exc:
+        logging.error("RECOVERY abort error  tx=%s  exc=%s", transaction_id, exc)
+
+
+def _resolve_via_peers(transaction_id: str) -> str:
+    """Cooperative termination: ask coordinator first, then sibling participant."""
+    for url in [
+        f"{GATEWAY_URL}/orders/transaction/{transaction_id}/status",
+        f"{GATEWAY_URL}/payment/transaction/{transaction_id}/status",
+    ]:
+        try:
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                status = r.json().get('status', 'UNKNOWN')
+                if status in ('COMMITTED', 'ABORTED'):
+                    return status
+        except requests.exceptions.RequestException:
+            continue
+    return 'UNKNOWN'
+
+
+def _recovery_sweep() -> None:
+    """Background thread: resolve stale PREPARED transactions."""
+    while True:
+        time.sleep(RECOVERY_INTERVAL_SECS)
+        if not GATEWAY_URL:
+            continue
+        try:
+            with db_pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute("""
+                        SELECT transaction_id
+                        FROM stock_transactions
+                        WHERE status = 'PREPARED'
+                          AND created_at < NOW() - %s * INTERVAL '1 second'
+                    """, (STALE_THRESHOLD_SECS,))
+                    stale = cur.fetchall()
+            for tx in stale:
+                tid = tx['transaction_id']
+                outcome = _resolve_via_peers(tid)
+                if outcome == 'COMMITTED':
+                    _recovery_commit(tid)
+                elif outcome == 'ABORTED':
+                    _recovery_abort(tid)
+        except Exception as exc:
+            logging.error("Stock recovery sweep error: %s", exc)
+
+
+if GATEWAY_URL:
+    threading.Thread(target=_recovery_sweep, daemon=True, name="stock-recovery").start()
 
 
 if __name__ == '__main__':

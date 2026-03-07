@@ -144,6 +144,11 @@ class TwoPhaseCommitCoordinator:
                         """,
                         (transaction_id, order_id, status.value),
                     )
+                    if status == TxStatus.COMMITTED:
+                        cur.execute(
+                            "UPDATE orders SET paid = TRUE WHERE order_id = %s",
+                            (order_id,),
+                        )
                     conn.commit()
             return True
         except psycopg.Error as exc:

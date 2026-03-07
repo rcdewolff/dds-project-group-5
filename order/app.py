@@ -250,14 +250,6 @@ def checkout(order_id: str):
         ))
         abort(400, result.error)
 
-    try:
-        with db_pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE orders SET paid = TRUE WHERE order_id = %s", (order_id,))
-                conn.commit()
-    except psycopg.Error:
-        abort(400, DB_ERROR_STR)
-
     kafka_producer.send(topic="order.events", value=BaseEvent.create(
         event_type="CHECKOUT_SUCCESS",
         payload=CheckoutPayload(order_id=order_id, user_id=order_entry.user_id),
