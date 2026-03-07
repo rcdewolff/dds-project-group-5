@@ -261,6 +261,12 @@ def checkout(order_id: str):
                     'correlation_id': corr_id}), 200
 
 
+@app.get('/transaction/<transaction_id>/status')
+def transaction_status(transaction_id: str):
+    """Participant inquiry protocol — participants poll to resolve uncertain txs."""
+    status = coordinator.get_transaction_status(transaction_id)
+    return jsonify({'transaction_id': transaction_id, 'status': status}), 200
+
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:

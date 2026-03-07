@@ -1,10 +1,13 @@
 import logging
 import os
 import atexit
+import threading
+import time
 import uuid
 import json
 
 import psycopg
+import requests
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from msgspec import Struct
@@ -216,6 +219,20 @@ def prepare_stock(transaction_id: str):
 
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
+                                # ── Idempotent: if already prepared/committed, return early ──
+                cur.execute(
+                    "SELECT status FROM stock_transactions WHERE transaction_id = %s",
+                    (transaction_id,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    if existing['status'] in ('PREPARED', 'COMMITTED'):
+                        return jsonify({
+                            'status': existing['status'],
+                            'transaction_id': transaction_id,
+                        }), 200
+                    abort(400, f"Transaction {transaction_id} already aborted")
+
                 for item in items:
                     cur.execute("SELECT stock FROM items WHERE item_id = %s FOR UPDATE", (item['item_id'],))
                     row = cur.fetchone()
@@ -257,8 +274,13 @@ def commit_stock(transaction_id: str):
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("SELECT * FROM stock_transactions WHERE transaction_id = %s",
                             (transaction_id,))
-                if cur.fetchone() is None:
+                tx = cur.fetchone()
+                if tx is None:
                     abort(400, f"Transaction {transaction_id} not found")
+                #Idempotency Check
+                if tx['status'] == 'COMMITTED':
+                    return jsonify({'status': 'COMMITTED', 'transaction_id': transaction_id}), 200
+                
                 cur.execute("SELECT * FROM stock_reservations WHERE transaction_id = %s",
                             (transaction_id,))
                 for res in cur.fetchall():

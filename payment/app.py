@@ -1,10 +1,13 @@
 import logging
 import os
 import atexit
+import threading
+import time
 import uuid
 import json
 
 import psycopg
+import requests
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from msgspec import Struct
@@ -197,7 +200,20 @@ def prepare_payment(transaction_id: str):
 
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT credit FROM users WHERE user_id = %s", (user_id,))
+            #Idempotency Check
+                cur.execute(
+                    "SELECT status FROM payment_transactions WHERE transaction_id = %s",
+                    (transaction_id,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    if existing['status'] in ('PREPARED', 'COMMITTED'):
+                        return jsonify({
+                            'status': existing['status'],
+                            'transaction_id': transaction_id,
+                        }), 200
+                    abort(400, f"Transaction {transaction_id} already aborted")                
+                cur.execute("SELECT credit FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
                 row = cur.fetchone()
                 if row is None:
                     abort(400, f"User {user_id} not found")
@@ -235,6 +251,9 @@ def commit_payment(transaction_id: str):
                 trans = cur.fetchone()
                 if trans is None:
                     abort(400, f"Transaction {transaction_id} not found")
+                #Idempotency Check
+                if trans['status'] == 'COMMITTED':
+                    return jsonify({'status': 'COMMITTED', 'transaction_id': transaction_id}), 200
                 cur.execute("UPDATE users SET credit = credit - %s WHERE user_id = %s",
                             (trans['amount'], trans['user_id']))
                 cur.execute("DELETE FROM credit_holds WHERE transaction_id = %s", (transaction_id,))
