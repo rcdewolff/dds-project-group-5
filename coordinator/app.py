@@ -3,24 +3,29 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 import psycopg
 import requests
 
 logger = logging.getLogger(__name__)
 
-# ── Retry configuration for commit phase ──
-MAX_COMMIT_RETRIES = 5
-INITIAL_RETRY_DELAY = 0.5  # seconds
+# ── Retry / reconciler tunables ──
+RETRIES_PER_ROUND = 3          # attempts per participant in one dissemination round
+INITIAL_RETRY_DELAY = 0.5      # seconds
+MAX_RETRY_DELAY = 30.0         # cap for exponential back-off
+RECONCILE_INTERVAL = 15        # seconds between reconciler sweeps
 
 
 class TxStatus(str, Enum):
-    """Presumed Abort: only COMMITTED is persisted to the coordinator log."""
-    COMMITTED = "COMMITTED"
+    COMMIT_DECIDED = "COMMIT_DECIDED"   # durable commit decision, dissemination in progress
+    ABORT_DECIDED  = "ABORT_DECIDED"    # durable abort decision, dissemination in progress
+    COMMITTED      = "COMMITTED"        # terminal – all commit ACKs received
+    ABORTED        = "ABORTED"          # terminal – all abort ACKs received
 
 
 class PrepareVote(str, Enum):
@@ -58,19 +63,30 @@ class CoordinatorResult:
 
 
 class TwoPhaseCommitCoordinator:
+    """Durable 2PC coordinator.
+
+    Correctness invariants
+    ----------------------
+    1. COMMIT_DECIDED is force-written **before** any commit message is sent.
+    2. ABORT_DECIDED is force-written **before** any abort message is sent
+       (when at least one participant voted YES and needs explicit abort).
+    3. Per-participant ACKs are tracked; the background reconciler retries
+       indefinitely until every participant has ACK'd.
+    4. On restart the reconciler resumes all incomplete txns automatically.
+    5. If no durable decision exists for a transaction, the inquiry protocol
+       returns ABORTED (presumed-abort rule).
+    """
 
     def __init__(self, db_pool, timeout: int = 10):
         self.db_pool = db_pool
         self.timeout = timeout
 
-    # ── public API ──
+    # ── public API ─────────────────────────────────────────────────────────
 
     def run(self, order_id: str, participants: list[Participant]) -> CoordinatorResult:
-        """Drive a full 2PC round.  Never raises — returns CoordinatorResult."""
+        """Drive a full 2PC round.  Never raises – returns CoordinatorResult."""
         transaction_id = str(uuid.uuid4())
         logger.debug("2PC START  tx=%s  order=%s", transaction_id, order_id)
-
-        # ── Presumed Abort: no INITIATED log write needed ──
 
         # ── Phase 1: Prepare (parallel) ──
         votes: dict[str, PrepareVote] = {}
@@ -87,38 +103,67 @@ class TwoPhaseCommitCoordinator:
                 votes[p.name] = vote
                 if vote == PrepareVote.YES:
                     prepared.append(p)
-                # READ_ONLY — noted but not added to 'prepared'
 
-        # Any NO vote → abort everyone who voted YES
+        # ── Decision ──
+
         if PrepareVote.NO in votes.values():
+            # === ABORT path ===
             failed = [n for n, v in votes.items() if v == PrepareVote.NO]
             logger.warning("2PC ABORT  tx=%s  vote=NO from %s", transaction_id, failed)
-            self._abort_all(transaction_id, prepared)
-            # Presumed Abort: no ABORTED log write needed
+
+            if prepared:
+                # Durably persist ABORT_DECIDED *before* sending any abort msgs
+                if self._persist_decision(
+                    transaction_id, order_id, TxStatus.ABORT_DECIDED, prepared
+                ):
+                    self._disseminate_aborts(transaction_id, prepared)
+                else:
+                    # DB unreachable – best-effort aborts; participants will
+                    # resolve via inquiry (presumed abort) eventually.
+                    self._best_effort_abort(transaction_id, prepared)
+
             return CoordinatorResult.failure(
                 transaction_id, f"Prepare failed for: {failed}"
             )
 
-        # ── Force-write COMMITTED before sending commits (Presumed Abort) ──
-        if not self._persist(transaction_id, order_id, TxStatus.COMMITTED):
-            self._abort_all(transaction_id, prepared)
+        # All voted YES (or READ_ONLY)
+        to_commit = [p for p in participants if votes.get(p.name) == PrepareVote.YES]
+
+        if not to_commit:
+            # All read-only – nothing to persist or commit
+            return CoordinatorResult.ok(transaction_id)
+
+        # === COMMIT path ===
+        # Force-write COMMIT_DECIDED + participant list + orders.paid
+        if not self._persist_decision(
+            transaction_id, order_id, TxStatus.COMMIT_DECIDED, to_commit
+        ):
+            # Cannot persist commit → must abort
+            # Try to durably record abort; if that also fails, best-effort.
+            if self._persist_decision(
+                transaction_id, order_id, TxStatus.ABORT_DECIDED, to_commit
+            ):
+                self._disseminate_aborts(transaction_id, to_commit)
+            else:
+                self._best_effort_abort(transaction_id, to_commit)
             return CoordinatorResult.failure(
                 transaction_id, "Failed to persist commit decision"
             )
+
         logger.debug("2PC COMMIT_DECIDED  tx=%s", transaction_id)
 
-        # ── Phase 2: Commit (parallel, with retries) ──
-        # Only commit participants that voted YES (skip READ_ONLY)
-        to_commit = [p for p in participants if votes.get(p.name) == PrepareVote.YES]
-        self._commit_all_with_retries(transaction_id, to_commit)
+        # ── Phase 2: Disseminate commits ──
+        # Best-effort in request thread; reconciler guarantees eventual delivery.
+        self._disseminate_commits(transaction_id, to_commit)
 
         logger.debug("2PC COMMITTED  tx=%s", transaction_id)
         return CoordinatorResult.ok(transaction_id)
 
     def get_transaction_status(self, transaction_id: str) -> str:
-        """Inquiry protocol: participants can poll this to resolve uncertain txs.
+        """Inquiry protocol – participants poll this to resolve uncertain txns.
 
-        Returns 'COMMITTED' if committed, 'ABORTED' otherwise (presumed abort).
+        Returns ``'COMMITTED'`` when the durable decision is commit,
+        ``'ABORTED'`` otherwise (including unknown txns → presumed abort).
         """
         try:
             with self.db_pool.connection() as conn:
@@ -128,14 +173,52 @@ class TwoPhaseCommitCoordinator:
                         (transaction_id,),
                     )
                     row = cur.fetchone()
-                    if row and row[0] == TxStatus.COMMITTED.value:
-                        return "COMMITTED"
+                    if row:
+                        s = row[0]
+                        if s in (TxStatus.COMMIT_DECIDED.value, TxStatus.COMMITTED.value):
+                            return "COMMITTED"
+                        if s in (TxStatus.ABORT_DECIDED.value, TxStatus.ABORTED.value):
+                            return "ABORTED"
         except psycopg.Error as exc:
             logger.error("Inquiry error  tx=%s  exc=%s", transaction_id, exc)
-        # Presumed Abort: unknown transaction → ABORTED
+        # Presumed abort: no record → ABORTED
         return "ABORTED"
 
-    # ── internal helpers ──
+    def reconcile(
+        self,
+        participant_factory: Callable[[str, str], Participant],
+    ) -> int:
+        """Resume every incomplete txn.  Called on startup **and** periodically.
+
+        ``participant_factory(transaction_id, participant_name) → Participant``
+        must reconstruct a :class:`Participant` from just the name (the
+        coordinator only persists participant names, not full URLs, because
+        those depend on the runtime ``GATEWAY_URL``).
+
+        Returns the count of transactions that still have un-ACK'd
+        participants (i.e. need further rounds).
+        """
+        remaining = 0
+
+        # ── COMMIT_DECIDED with un-ACK'd participants ──
+        remaining += self._reconcile_status(
+            TxStatus.COMMIT_DECIDED,
+            TxStatus.COMMITTED,
+            self._disseminate_commits,
+            participant_factory,
+        )
+
+        # ── ABORT_DECIDED with un-ACK'd participants ──
+        remaining += self._reconcile_status(
+            TxStatus.ABORT_DECIDED,
+            TxStatus.ABORTED,
+            self._disseminate_aborts,
+            participant_factory,
+        )
+
+        return remaining
+
+    # ── internal: Phase-1 ──────────────────────────────────────────────────
 
     def _prepare(self, transaction_id: str, p: Participant) -> PrepareVote:
         try:
@@ -147,7 +230,6 @@ class TwoPhaseCommitCoordinator:
             if r.status_code != 200:
                 logger.warning("PREPARE fail  participant=%s  status=%s", p.name, r.status_code)
                 return PrepareVote.NO
-            # Read-only optimisation: participant signals no mutation needed
             body = r.json() if r.content else {}
             if body.get("read_only", False):
                 logger.debug("PREPARE read-only  participant=%s", p.name)
@@ -157,80 +239,176 @@ class TwoPhaseCommitCoordinator:
             logger.error("PREPARE error  participant=%s  exc=%s", p.name, exc)
             return PrepareVote.NO
 
-    def _commit_with_retries(self, transaction_id: str, p: Participant) -> bool:
-        """Commit with exponential-backoff retries.
+    # ── internal: Phase-2 dissemination ────────────────────────────────────
 
-        The commit decision is irrevocable — we MUST keep retrying.
+    def _disseminate_commits(
+        self, transaction_id: str, participants: list[Participant]
+    ) -> None:
+        """Send commit to each participant; mark ACK on success.
+
+        If every participant ACKs, the txn is finalised to COMMITTED.
+        Un-ACK'd participants will be retried by the reconciler.
         """
+        if not participants:
+            return
+        self._disseminate(
+            transaction_id, participants, self._send_commit, TxStatus.COMMITTED
+        )
+
+    def _disseminate_aborts(
+        self, transaction_id: str, participants: list[Participant]
+    ) -> None:
+        """Send abort to each participant; mark ACK on success."""
+        if not participants:
+            return
+        self._disseminate(
+            transaction_id, participants, self._send_abort, TxStatus.ABORTED
+        )
+
+    def _disseminate(
+        self,
+        transaction_id: str,
+        participants: list[Participant],
+        send_fn: Callable[[str, Participant], bool],
+        final_status: TxStatus,
+    ) -> None:
+        with ThreadPoolExecutor(max_workers=len(participants)) as pool:
+            futures = {
+                pool.submit(send_fn, transaction_id, p): p
+                for p in participants
+            }
+            all_acked = True
+            for future in as_completed(futures):
+                p = futures[future]
+                if future.result():
+                    self._mark_acked(transaction_id, p.name)
+                else:
+                    all_acked = False
+        if all_acked:
+            self._finalize_tx(transaction_id, final_status)
+
+    def _send_commit(self, transaction_id: str, p: Participant) -> bool:
+        """Send commit with a bounded number of retries for this round."""
+        return self._send_with_retries(
+            transaction_id, p, p.commit_url, "COMMIT"
+        )
+
+    def _send_abort(self, transaction_id: str, p: Participant) -> bool:
+        """Send abort with a bounded number of retries for this round."""
+        return self._send_with_retries(
+            transaction_id, p, p.abort_url, "ABORT"
+        )
+
+    def _send_with_retries(
+        self, transaction_id: str, p: Participant, url_template: str, label: str
+    ) -> bool:
         delay = INITIAL_RETRY_DELAY
-        for attempt in range(1, MAX_COMMIT_RETRIES + 1):
+        for attempt in range(1, RETRIES_PER_ROUND + 1):
             try:
                 r = requests.post(
-                    p.url(p.commit_url, transaction_id), timeout=self.timeout
+                    p.url(url_template, transaction_id), timeout=self.timeout
                 )
                 if r.status_code == 200:
                     return True
                 logger.warning(
-                    "COMMIT fail  participant=%s  status=%s  attempt=%d",
-                    p.name, r.status_code, attempt,
+                    "%s fail  participant=%s  status=%s  attempt=%d",
+                    label, p.name, r.status_code, attempt,
                 )
             except requests.exceptions.RequestException as exc:
                 logger.warning(
-                    "COMMIT error  participant=%s  exc=%s  attempt=%d",
-                    p.name, exc, attempt,
+                    "%s error  participant=%s  exc=%s  attempt=%d",
+                    label, p.name, exc, attempt,
                 )
-            if attempt < MAX_COMMIT_RETRIES:
+            if attempt < RETRIES_PER_ROUND:
                 time.sleep(delay)
-                delay *= 2
-        logger.critical(
-            "COMMIT EXHAUSTED RETRIES  participant=%s  tx=%s", p.name, transaction_id
-        )
+                delay = min(delay * 2, MAX_RETRY_DELAY)
         return False
 
-    def _commit_all_with_retries(
+    def _best_effort_abort(
         self, transaction_id: str, participants: list[Participant]
     ) -> None:
-        """Commit all participants in parallel with retries."""
+        """Fire-and-forget aborts when no durable state could be written."""
         if not participants:
             return
         with ThreadPoolExecutor(max_workers=len(participants)) as pool:
-            futures = {
-                pool.submit(self._commit_with_retries, transaction_id, p): p
+            futs = [
+                pool.submit(self._send_abort, transaction_id, p)
                 for p in participants
-            }
-            for future in as_completed(futures):
-                p = futures[future]
-                if not future.result():
-                    logger.critical(
-                        "COMMIT PERMANENTLY FAILED  participant=%s  tx=%s — "
-                        "requires recovery sweep",
-                        p.name, transaction_id,
-                    )
-
-    def _abort(self, transaction_id: str, p: Participant) -> None:
-        try:
-            requests.post(p.url(p.abort_url, transaction_id), timeout=self.timeout)
-        except requests.exceptions.RequestException as exc:
-            logger.error("ABORT error  participant=%s  exc=%s", p.name, exc)
-
-    def _abort_all(self, transaction_id: str, participants: list[Participant]) -> None:
-        """Abort all given participants in parallel."""
-        if not participants:
-            return
-        with ThreadPoolExecutor(max_workers=len(participants)) as pool:
-            futures = [
-                pool.submit(self._abort, transaction_id, p) for p in participants
             ]
-            for f in as_completed(futures):
-                f.result()  # propagate any unexpected exceptions
+            for f in as_completed(futs):
+                f.result()
 
-    def _persist(self, transaction_id: str, order_id: str, status: TxStatus) -> bool:
+    # ── internal: reconciler ───────────────────────────────────────────────
+
+    def _reconcile_status(
+        self,
+        in_progress_status: TxStatus,
+        terminal_status: TxStatus,
+        disseminate_fn: Callable[[str, list[Participant]], None],
+        participant_factory: Callable[[str, str], Participant],
+    ) -> int:
+        remaining = 0
         try:
             with self.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO order_transactions (transaction_id, order_id, status)
+                        SELECT t.transaction_id, p.participant_name
+                        FROM order_transactions t
+                        JOIN tx_participants p
+                          ON t.transaction_id = p.transaction_id
+                        WHERE t.status = %s AND p.acked = FALSE
+                        """,
+                        (in_progress_status.value,),
+                    )
+                    rows = cur.fetchall()
+
+            tx_parts: dict[str, list[str]] = defaultdict(list)
+            for tx_id, p_name in rows:
+                tx_parts[tx_id].append(p_name)
+
+            for tx_id, names in tx_parts.items():
+                parts: list[Participant] = []
+                for name in names:
+                    try:
+                        parts.append(participant_factory(tx_id, name))
+                    except Exception as exc:
+                        logger.error(
+                            "Cannot build participant %s for tx=%s: %s",
+                            name, tx_id, exc,
+                        )
+                if parts:
+                    disseminate_fn(tx_id, parts)
+                    # Check if all are now ACK'd
+                    if not self._all_acked(tx_id):
+                        remaining += 1
+
+        except psycopg.Error as exc:
+            logger.error("Reconciler DB error: %s", exc)
+
+        return remaining
+
+    # ── internal: persistence ──────────────────────────────────────────────
+
+    def _persist_decision(
+        self,
+        transaction_id: str,
+        order_id: str,
+        status: TxStatus,
+        participants: list[Participant],
+    ) -> bool:
+        """Atomically persist decision + participant list.
+
+        For COMMIT_DECIDED this also sets ``orders.paid = TRUE`` so that the
+        order is immediately visible as paid once the decision is durable.
+        """
+        try:
+            with self.db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO order_transactions
+                               (transaction_id, order_id, status)
                         VALUES (%s, %s, %s)
                         ON CONFLICT (transaction_id)
                         DO UPDATE SET status = EXCLUDED.status
@@ -238,7 +416,18 @@ class TwoPhaseCommitCoordinator:
                         (transaction_id, order_id, status.value),
                         prepare=False,
                     )
-                    if status == TxStatus.COMMITTED:
+                    for p in participants:
+                        cur.execute(
+                            """
+                            INSERT INTO tx_participants
+                                   (transaction_id, participant_name, acked)
+                            VALUES (%s, %s, FALSE)
+                            ON CONFLICT (transaction_id, participant_name)
+                            DO NOTHING
+                            """,
+                            (transaction_id, p.name),
+                        )
+                    if status == TxStatus.COMMIT_DECIDED:
                         cur.execute(
                             "UPDATE orders SET paid = TRUE WHERE order_id = %s",
                             (order_id,),
@@ -246,6 +435,57 @@ class TwoPhaseCommitCoordinator:
                     conn.commit()
             return True
         except psycopg.Error as exc:
-            logger.error("Failed to persist tx  tx=%s  status=%s  exc=%s",
-                        transaction_id, status, exc)
+            logger.error(
+                "Failed to persist decision  tx=%s  status=%s  exc=%s",
+                transaction_id, status, exc,
+            )
             return False
+
+    def _mark_acked(self, transaction_id: str, participant_name: str) -> None:
+        try:
+            with self.db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE tx_participants SET acked = TRUE
+                        WHERE transaction_id = %s AND participant_name = %s
+                        """,
+                        (transaction_id, participant_name),
+                    )
+                    conn.commit()
+        except psycopg.Error as exc:
+            logger.error(
+                "Failed to mark ACK  tx=%s  p=%s  exc=%s",
+                transaction_id, participant_name, exc,
+            )
+
+    def _all_acked(self, transaction_id: str) -> bool:
+        try:
+            with self.db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) FROM tx_participants
+                        WHERE transaction_id = %s AND acked = FALSE
+                        """,
+                        (transaction_id,),
+                    )
+                    return cur.fetchone()[0] == 0
+        except psycopg.Error:
+            return False
+
+    def _finalize_tx(self, transaction_id: str, final_status: TxStatus) -> None:
+        """Advance to terminal state once every participant has ACK'd."""
+        try:
+            with self.db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE order_transactions SET status = %s WHERE transaction_id = %s",
+                        (final_status.value, transaction_id),
+                    )
+                    conn.commit()
+        except psycopg.Error as exc:
+            logger.error(
+                "Failed to finalize  tx=%s  status=%s  exc=%s",
+                transaction_id, final_status, exc,
+            )

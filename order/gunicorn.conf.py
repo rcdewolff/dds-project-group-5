@@ -9,6 +9,7 @@ def post_fork(server, worker):
     import threading
     from kafka_service import kafka_client
     from psycopg_pool import ConnectionPool
+    from coordinator import TwoPhaseCommitCoordinator
     import app
 
     # Reinitialize DB pool
@@ -21,6 +22,9 @@ def post_fork(server, worker):
     )
     app.event_consumer._db_pool = app.db_pool
 
+    # Reinitialize the coordinator with the new DB pool
+    app.coordinator = TwoPhaseCommitCoordinator(app.db_pool, timeout=10)
+
     # Reinitialize Kafka
     order_kafka = kafka_client.Client(app.service_name, ['order.events', 'stock.events', 'payment.events'])
     app.kafka_producer = order_kafka.producer
@@ -28,3 +32,6 @@ def post_fork(server, worker):
     app.event_consumer._consumer = order_kafka.consumer
 
     threading.Thread(target=app.consume_messages, daemon=True).start()
+
+    # Start reconciler (immediate startup sweep + periodic background thread)
+    app.start_reconciler()

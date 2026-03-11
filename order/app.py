@@ -2,6 +2,8 @@ import logging
 import os
 import atexit
 import random
+import threading
+import time
 import uuid
 from collections import defaultdict
 
@@ -17,6 +19,7 @@ from kafka_service import kafka_client
 from kafka_service.kafka_event import BaseEvent, OrderPayload, CheckoutPayload
 from kafka_service.consumer_handler import EventConsumer
 from coordinator import TwoPhaseCommitCoordinator, Participant
+from coordinator.app import RECONCILE_INTERVAL
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -67,13 +70,20 @@ def init_db():
                     total_cost INTEGER NOT NULL
                 )
             """)
-            cur.execute("DROP TABLE IF EXISTS order_transactions CASCADE")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS order_transactions (
                     transaction_id TEXT PRIMARY KEY,
                     order_id       TEXT NOT NULL,
-                    status         TEXT NOT NULL DEFAULT 'INITIATED',
+                    status         TEXT NOT NULL,
                     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tx_participants (
+                    transaction_id  TEXT    NOT NULL,
+                    participant_name TEXT   NOT NULL,
+                    acked           BOOLEAN NOT NULL DEFAULT FALSE,
+                    PRIMARY KEY (transaction_id, participant_name)
                 )
             """)
             cur.execute("""
@@ -92,6 +102,49 @@ def init_db():
 
 def close_db_connection():
     db_pool.close()
+
+
+def _build_participant(transaction_id: str, name: str) -> Participant:
+    """Reconstruct a Participant from its persisted name + runtime GATEWAY_URL."""
+    if name == "stock":
+        return Participant(
+            name="stock",
+            prepare_url=f"{GATEWAY_URL}/stock/prepare/{{transaction_id}}",
+            commit_url=f"{GATEWAY_URL}/stock/commit/{{transaction_id}}",
+            abort_url=f"{GATEWAY_URL}/stock/abort/{{transaction_id}}",
+        )
+    if name == "payment":
+        return Participant(
+            name="payment",
+            prepare_url=f"{GATEWAY_URL}/payment/prepare/{{transaction_id}}",
+            commit_url=f"{GATEWAY_URL}/payment/commit/{{transaction_id}}",
+            abort_url=f"{GATEWAY_URL}/payment/abort/{{transaction_id}}",
+        )
+    raise ValueError(f"Unknown participant: {name}")
+
+
+def _reconciler_loop():
+    """Background thread: keep retrying incomplete txns until all ACK'd."""
+    while True:
+        time.sleep(RECONCILE_INTERVAL)
+        try:
+            remaining = coordinator.reconcile(_build_participant)
+            if remaining:
+                logging.info("Reconciler: %d txns still incomplete", remaining)
+        except Exception as exc:
+            logging.error("Reconciler error: %s", exc)
+
+
+def start_reconciler():
+    """Start the background reconciler and run one immediate sweep."""
+    # Immediate recovery sweep on startup
+    try:
+        remaining = coordinator.reconcile(_build_participant)
+        if remaining:
+            logging.info("Startup recovery: %d txns still incomplete", remaining)
+    except Exception as exc:
+        logging.error("Startup recovery error: %s", exc)
+    threading.Thread(target=_reconciler_loop, daemon=True, name="order-reconciler").start()
 
 
 init_db()

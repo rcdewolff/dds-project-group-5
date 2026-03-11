@@ -275,20 +275,25 @@ def commit_stock(transaction_id: str):
     try:
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT * FROM stock_transactions WHERE transaction_id = %s",
-                            (transaction_id,))
+                cur.execute(
+                    "SELECT * FROM stock_transactions WHERE transaction_id = %s FOR UPDATE",
+                    (transaction_id,),
+                )
                 tx = cur.fetchone()
                 if tx is None:
                     abort(400, f"Transaction {transaction_id} not found")
-                #Idempotency Check
+                # Idempotent: already committed → ACK again
                 if tx['status'] == 'COMMITTED':
                     return jsonify({'status': 'COMMITTED', 'transaction_id': transaction_id}), 200
-                
+                # Safety: never commit an already-aborted transaction
+                if tx['status'] == 'ABORTED':
+                    abort(409, f"Transaction {transaction_id} already aborted")
+
                 cur.execute("SELECT * FROM stock_reservations WHERE transaction_id = %s",
                             (transaction_id,))
                 for res in cur.fetchall():
                     cur.execute("UPDATE items SET stock = stock - %s WHERE item_id = %s",
-                                (res['quantity'], res['item_id']))               
+                                (res['quantity'], res['item_id']))
                 cur.execute("DELETE FROM stock_reservations WHERE transaction_id = %s", (transaction_id,))
                 cur.execute("UPDATE stock_transactions SET status = 'COMMITTED' WHERE transaction_id = %s",
                             (transaction_id,))
@@ -302,7 +307,18 @@ def commit_stock(transaction_id: str):
 def abort_stock(transaction_id: str):
     try:
         with db_pool.connection() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT status FROM stock_transactions WHERE transaction_id = %s FOR UPDATE",
+                    (transaction_id,),
+                )
+                row = cur.fetchone()
+                # Idempotent: unknown or already aborted → ACK
+                if row is None or row['status'] == 'ABORTED':
+                    return jsonify({'status': 'ABORTED', 'transaction_id': transaction_id}), 200
+                # Safety: never abort an already-committed transaction
+                if row['status'] == 'COMMITTED':
+                    abort(409, f"Transaction {transaction_id} already committed")
                 cur.execute("DELETE FROM stock_reservations WHERE transaction_id = %s",
                             (transaction_id,))
                 cur.execute("UPDATE stock_transactions SET status = 'ABORTED' WHERE transaction_id = %s",

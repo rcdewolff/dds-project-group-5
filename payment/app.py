@@ -249,14 +249,19 @@ def commit_payment(transaction_id: str):
     try:
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT * FROM payment_transactions WHERE transaction_id = %s",
-                            (transaction_id,))
+                cur.execute(
+                    "SELECT * FROM payment_transactions WHERE transaction_id = %s FOR UPDATE",
+                    (transaction_id,),
+                )
                 trans = cur.fetchone()
                 if trans is None:
                     abort(400, f"Transaction {transaction_id} not found")
-                #Idempotency Check
+                # Idempotent: already committed → ACK again
                 if trans['status'] == 'COMMITTED':
                     return jsonify({'status': 'COMMITTED', 'transaction_id': transaction_id}), 200
+                # Safety: never commit an already-aborted transaction
+                if trans['status'] == 'ABORTED':
+                    abort(409, f"Transaction {transaction_id} already aborted")
                 cur.execute("UPDATE users SET credit = credit - %s WHERE user_id = %s",
                             (trans['amount'], trans['user_id']))
                 cur.execute("DELETE FROM credit_holds WHERE transaction_id = %s", (transaction_id,))
@@ -272,7 +277,18 @@ def commit_payment(transaction_id: str):
 def abort_payment(transaction_id: str):
     try:
         with db_pool.connection() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT status FROM payment_transactions WHERE transaction_id = %s FOR UPDATE",
+                    (transaction_id,),
+                )
+                row = cur.fetchone()
+                # Idempotent: unknown or already aborted → ACK
+                if row is None or row['status'] == 'ABORTED':
+                    return jsonify({'status': 'ABORTED', 'transaction_id': transaction_id}), 200
+                # Safety: never abort an already-committed transaction
+                if row['status'] == 'COMMITTED':
+                    abort(409, f"Transaction {transaction_id} already committed")
                 cur.execute("DELETE FROM credit_holds WHERE transaction_id = %s", (transaction_id,))
                 cur.execute("UPDATE payment_transactions SET status = 'ABORTED' WHERE transaction_id = %s",
                             (transaction_id,))
