@@ -23,7 +23,7 @@ import uuid
 import redis.asyncio as aioredis
 
 from services import utils
-from saga_core import SagaStatus, SimpleSagaContext, SimpleSagaStep
+from saga_core import SagaStatus, SagaContext, SagaStep
 
 
 logger = logging.getLogger(__name__)
@@ -64,14 +64,14 @@ class CheckoutSagaOrchestrator:
         if not items_list:
             return {"status": "failed", "message": "Order has no items."}, 400
 
-        context = SimpleSagaContext(
+        context = SagaContext(
             data={
                 "order_id": order_id,
                 "user_id": order_value.user_id,
                 "items": items_list,
             }, 
             saga_id=str(uuid.uuid4()),
-            step=SimpleSagaStep.CHECKOUT,
+            step=SagaStep.CHECKOUT,
             status=SagaStatus.PENDING,
             results={}
         )
@@ -102,7 +102,7 @@ class CheckoutSagaOrchestrator:
                 }, 400
 
             # Stock allocated — advance to payment phase
-            context.set_result(SimpleSagaStep.STOCK_RESERVATION.value, stock_msg)
+            context.set_result(SagaStep.STOCK_RESERVATION.value, stock_msg)
             context.advance()
             logger.info(f"Saga [{context.saga_id}] stock allocated, triggering payment.")
 
@@ -119,7 +119,7 @@ class CheckoutSagaOrchestrator:
                 return self._timeout_response(order_id, context.saga_id)
 
             if payment_msg["status"] == "success":
-                context.set_result(SimpleSagaStep.PAYMENT.value, payment_msg)
+                context.set_result(SagaStep.PAYMENT.value, payment_msg)
                 context.status = SagaStatus.COMPLETED
                 logger.info(f"Saga [{context.saga_id}] completed successfully.")
                 return {
@@ -189,7 +189,7 @@ class CheckoutSagaOrchestrator:
     # Kafka commands
     # ------------------------------------------------------------------
 
-    async def _emit_reserve_stock(self, context: SimpleSagaContext):
+    async def _emit_reserve_stock(self, context: SagaContext):
         event = utils.BaseEvent(
             event_type=utils.Commands.RESERVE_STOCK,
             correlation_id=context.saga_id,
@@ -203,7 +203,7 @@ class CheckoutSagaOrchestrator:
 
     async def _emit_start_payment(
         self,
-        context: SimpleSagaContext,
+        context: SagaContext,
         order_id: str,
         amount: int
     ):
@@ -219,7 +219,7 @@ class CheckoutSagaOrchestrator:
         await self.kafka_producer.send("payment.request", value=event)
         logger.info(f"Saga [{context.saga_id}] emitted START_PAYMENT.")
 
-    async def _emit_free_stock(self, context: SimpleSagaContext, order_id: str):
+    async def _emit_free_stock(self, context: SagaContext, order_id: str):
         event = utils.BaseEvent(
             event_type=utils.Commands.FREE_STOCK,
             correlation_id=context.saga_id,
@@ -231,8 +231,8 @@ class CheckoutSagaOrchestrator:
         await self.kafka_producer.send("stock.request", value=event)
         logger.info(f"Saga [{context.saga_id}] emitted FREE_STOCK.")
 
-    async def _compensate(self, context: SimpleSagaContext):
-        stock_result = context.get_result(SimpleSagaStep.STOCK_RESERVATION.value)
+    async def _compensate(self, context: SagaContext):
+        stock_result = context.get_result(SagaStep.STOCK_RESERVATION.value)
         if stock_result:
             await self._emit_free_stock(context, stock_result["order_id"])
 

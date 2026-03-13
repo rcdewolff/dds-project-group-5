@@ -17,7 +17,7 @@ class SagaStatus(Enum):
     COMPENSATED = "compensated"  # Successfully rolled back
 
 
-class SimpleSagaStep(Enum):
+class SagaStep(Enum):
     """
     Represents the three steps of the checkout saga in execution order.
     Progression: CHECKOUT → STOCK_RESERVATION → PAYMENT
@@ -27,42 +27,39 @@ class SimpleSagaStep(Enum):
     PAYMENT = "PAYMENT_PHASE"                       # Step 3: charge payment service
 
 @dataclass
-class SimpleSagaContext:
-    saga_id: str                        # = correlation_id
-    step: SimpleSagaStep                # current phase
-    status: SagaStatus                  # PENDING, RUNNING, COMPENSATING etc.
-    data: Dict[str, Any]                # order_id, user_id, items — immutable input
-    results: Dict[str, Any] 
+class SagaContext:
+    """
+    Context for managing the state of a simple saga.
+    """
+    saga_id: str
+    step: SagaStep
+    status: SagaStatus
+    order_id: str
+    user_id: str
+    items: List[dict[str, int]]
+    results: Dict[SagaStep, Any] = field(default_factory=dict)  # ← key by step, not string
     
-    def set_result(self, step: str, result: Any):
+    def set_result(self, step: SagaStep, result: Any):
         self.results[step] = result
 
     def advance(self):
-        if self.step == SimpleSagaStep.CHECKOUT:
-            self.step = SimpleSagaStep.STOCK_RESERVATION
-        elif self.step == SimpleSagaStep.STOCK_RESERVATION:
-            self.step = SimpleSagaStep.PAYMENT
+        """
+        Advance to the next step in the saga.
+        Raises an exception if there are no further steps.
+        """
+        if self.step == SagaStep.CHECKOUT:
+            self.step = SagaStep.STOCK_RESERVATION
+
+
+        elif self.step == SagaStep.STOCK_RESERVATION:
+            self.step = SagaStep.PAYMENT
+        
         else:
             raise Exception("No further steps to advance to.")
     
-    def get_result(self, step: str) -> Optional[Any]:
+    def get_result(self, step: SagaStep) -> Optional[Any]:
         return self.results.get(step)
     
 
-
-# The coordinator logic lives here, not in a Callable
-class CheckoutSagaOrchestrator:
-    def start(self, context: SimpleSagaContext):
-        
-        pass
-        # emit RESERVE_STOCK command to Kafka
-        # subscribe to Redis, wait for reply
-        # on success: advance(), emit START_PAYMENT
-        # on failure: emit compensation commands
-
-    def compensate(self, context: SimpleSagaContext):
-        pass
-        # walk back completed_steps in reverse
-        # emit FREE_STOCK, ROLLBACK_PAYMENT etc.
 
 

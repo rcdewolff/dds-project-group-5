@@ -1,6 +1,6 @@
 import os
 from services import kafka_client,utils
-import redis
+import redis # type: ignore
 from msgspec import json
 import logging
 

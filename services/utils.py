@@ -43,14 +43,17 @@ class BaseEvent(Struct, Generic[J]):
     event_type: str
     correlation_id: str
     payload: J
+    saga_id: str
+
     timestamp: float = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
     @classmethod
-    def create(cls, event_type: str, payload: J, corr_id: str = ""):
+    def create(cls, event_type: str, payload: J, corr_id: str = "", saga_id: str = ""):
         return cls(
             event_type=event_type,
             payload=payload,
-            correlation_id=corr_id or str(uuid.uuid4())
+            correlation_id=corr_id or str(uuid.uuid4()),
+            saga_id=saga_id or str(uuid.uuid4())
         )
 
 
@@ -60,7 +63,7 @@ class OrderCheckoutPayload(Struct):
     Payload for an order checkout event.
     """
     order_id: str
-    items: list[tuple[str,int]]
+    items: list[dict[str,int]]
     
 
 class StartPaymentCommandPayload(Struct):
@@ -77,7 +80,7 @@ class ReserveStockCommandPayload(Struct):
     Payload for a reserve stock command event.
     """
     order_id: str
-    items: list[tuple[str,int]]
+    items: list[dict[str,int]]
 
 class StockUnavailablePayload(Struct):
     """
@@ -100,6 +103,14 @@ class StockFreedPayload(Struct):
     Payload for a stock freed event.
     """
     order_id: str
+
+
+class FreeStockCommandPayload(Struct):
+    """
+    Payload for a free stock command event.
+    """
+    order_id: str
+    items: list[dict[str,int]]
 
 
 class PaymentProcessedPayload(Struct):
@@ -137,12 +148,25 @@ class Commands(StrEnum):
     ROLLBACK_PAYMENT = "rollback_payment"
 
 
+
 class OrderInternalEvent(StrEnum):
     ORDER_CREATED = "order_created"
     ITEM_ADDED = "item_added"
     CHECKOUT_INITIATED = "checkout_initiated"
     ORDER_CANCELLED = "order_cancelled"
     ORDER_COMPLETED = "order_completed"
+
+
+class SagaEvents(StrEnum):
+    # Lifecycle
+    SAGA_CREATED   = "saga.created"
+    SAGA_ENDED     = "saga.ended"
+    SAGA_TIMEOUT   = "saga.timeout"
+
+    # Steps — status field carries PENDING/SUCCESS/FAILED/COMPENSATING/COMPENSATED
+    STOCK_RESERVATION = "saga.stock"
+    PAYMENT           = "saga.payment"
+
 
 class PaymentInternalEvent(StrEnum):
     USER_CREATED = "user_created"
@@ -225,7 +249,8 @@ def decode_and_type_event(record: Any) -> DecodeResult:
                 event_type=envelope.event_type,
                 correlation_id=envelope.correlation_id,
                 payload=typed_payload,
-                timestamp=envelope.timestamp
+                timestamp=envelope.timestamp,
+                saga_id=envelope.saga_id
             )
         )
     
@@ -243,3 +268,31 @@ class RedisMessageWrapper:
     """
     def __init__(self, data):
         self.value = data.encode() if isinstance(data, str) else data
+
+
+def build_reserve_stock_command(saga_id: str, order_id: str, items: list) -> tuple[str, bytes]:
+    event = BaseEvent(
+        event_type=Commands.RESERVE_STOCK,
+        correlation_id=order_id,
+        saga_id=saga_id,
+        payload=ReserveStockCommandPayload(order_id=order_id, items=items),
+    )
+    return "stock.request", json.encode(event)
+
+def build_start_payment_command(saga_id: str, order_id: str, user_id: str, amount: int) -> tuple[str, bytes]:
+    event = BaseEvent(
+        event_type=Commands.START_PAYMENT,
+        correlation_id=order_id,
+        saga_id=saga_id,
+        payload=StartPaymentCommandPayload(order_id=order_id, user_id=user_id, amount=amount),
+    )
+    return "payment.request", json.encode(event)
+
+def build_free_stock_command(saga_id: str, order_id: str, items: list) -> tuple[str, bytes]:
+    event = BaseEvent(
+        event_type=Commands.FREE_STOCK,
+        correlation_id=order_id,
+        saga_id=saga_id,
+        payload=FreeStockCommandPayload(order_id=order_id, items=items),
+    )
+    return "stock.request", json.encode(event)

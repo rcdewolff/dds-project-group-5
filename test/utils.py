@@ -190,7 +190,6 @@ def test_add_item_to_order():
    
 
 
-
 def test_saga_failure():
     order_id = setup_test_environment(items=[1, 2], credit=10)
     if order_id != "":
@@ -201,7 +200,6 @@ def test_saga_failure():
     
     checkout_order_response = checkout_order(order_id)
     print(f"Checkout response status code: {checkout_order_response.status_code}")
-    
 
 if __name__ == '__main__':
     # setup_test_environment(2)

@@ -5,16 +5,23 @@ import random
 import time
 from typing import Dict
 import uuid
-from collections import defaultdict
-import redis
-import psycopg
-from psycopg_pool import ConnectionPool
-from psycopg.rows import dict_row
+import redis # type: ignore
+import psycopg # type: ignore
+from psycopg_pool import ConnectionPool # type: ignore
+from psycopg.rows import dict_row # type: ignore
 import requests
 from flask import Flask, jsonify, abort, Response
 from services import utils
 from msgspec import json, Struct
 import threading
+from orchestrator_sync import CheckoutSagaOrchestrator
+
+
+SAGA_TIMEOUT_SECONDS = 30
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -72,11 +79,24 @@ def consume_messages(consumer):
 
 
 
+# Instantiate once at module level — reused across all requests
+# kafka_producer and db_pool are set in post_fork so we pass them lazily via a factory
+def get_orchestrator() -> CheckoutSagaOrchestrator:
+    return CheckoutSagaOrchestrator(
+        kafka_producer=kafka_producer,
+        redis_client=redis_client,
+        db_pool=db_pool,
+        timeout_seconds=SAGA_TIMEOUT_SECONDS,
+    )
+
+
+
 def init_db():
     """Initialize database table"""
     tmp_pool = init_db_pool()
     with tmp_pool.connection() as conn:
         with conn.cursor() as cur:
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
                     order_id TEXT PRIMARY KEY,
@@ -86,24 +106,49 @@ def init_db():
                     total_cost INTEGER NOT NULL
                 )
             """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS sagas (
-                    correlation_id TEXT PRIMARY KEY,
+                    order_id TEXT NOT NULL,
+                    id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
-                    result JSONB
+                    step TEXT NOT NULL,
+                    results JSONB
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS log (
+                    id TEXT PRIMARY KEY,   
+                    order_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    data TEXT NOT NULL
+                )
+            """)
+
+            
+
+            # Implement a table for outbox messages if needed in the future
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS outbox (
+                    id TEXT PRIMARY KEY,
+                    topic TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    sent BOOLEAN DEFAULT FALSE
                 )
             """)
             
     tmp_pool.close()
 
 
-def log_event(event: utils.BaseEvent) -> bool:
-    pass
-    # Event json to be stored
+def log_event(event: utils.BaseEvent) -> bool: # type: ignore
+    
     event_details = json.encode(event)
 
     query = """
-        INSERT INTO log (idempotency_key, event_type, details) 
+        INSERT INTO log (order_id, event_type, data) 
         VALUES (%s,%s::jsonb,%s)
         """
     
@@ -122,7 +167,6 @@ def close_db_connection():
 # Initialize database on startup
 init_db()
 atexit.register(close_db_connection)
-
 
 class OrderValue(Struct):
     paid: bool
@@ -207,7 +251,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
 
 @app.get('/find/<order_id>')
 def find_order(order_id: str):
-    order_entry: OrderValue = get_order_from_db(order_id)
+    order_entry: OrderValue = get_order_from_db(order_id) # type: ignore
     return jsonify(
         {
             "order_id": order_id,
@@ -241,7 +285,7 @@ def test_kafka(service: str):
 
     print("Sending message via kafka...")
     try: 
-        kafka_producer.send(
+        kafka_producer.send( # type: ignore
             topic = f'stock.request',
             value=event
         )   
@@ -261,7 +305,7 @@ def test_kafka(service: str):
             "result": None
         }
 
-    kafka_producer.send(topic='stock.request', value=event)
+    kafka_producer.send(topic='stock.request', value=event) # type: ignore
 
     # Block until Kafka consumer resolves the saga or timeout expires
     completed = wait_event.wait(timeout=SAGA_TIMEOUT_SECONDS)
@@ -314,7 +358,7 @@ def send_get_request(url: str):
 @app.post('/addItem/<order_id>/<item_id>/<int:quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
     app.logger.info(f"item: {item_id} quantity: {quantity} order: {order_id}")
-    order_entry: OrderValue = get_order_from_db(order_id)
+    order_entry: OrderValue = get_order_from_db(order_id) # type: ignore
     
     # Convert items to JSON format for storage
     items_json = [{'item_id': item[0], 'quantity': item[1]} for item in order_entry.items]
@@ -348,7 +392,6 @@ def add_item(order_id: str, item_id: str, quantity: int):
         "user_id": order_entry.user_id
     }),200
 
-
 def rollback_stock(removed_items: list[tuple[str, int]]):
     for item_id, quantity in removed_items:
         send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
@@ -358,98 +401,40 @@ def handle_rollback(event: utils.BaseEvent):
     
     pass
 
-SAGA_TIMEOUT_SECONDS = 30
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-
-from orchestrator_sync import CheckoutSagaOrchestrator
-
-# Instantiate once at module level — reused across all requests
-# kafka_producer and db_pool are set in post_fork so we pass them lazily via a factory
-def get_orchestrator() -> CheckoutSagaOrchestrator:
-    return CheckoutSagaOrchestrator(
-        kafka_producer=kafka_producer,
-        redis_client=redis_client,
-        db_pool=db_pool,
-        timeout_seconds=SAGA_TIMEOUT_SECONDS,
-    )
 
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    order_value: OrderValue = get_order_from_db(order_id)
+    order_value: OrderValue = get_order_from_db(order_id) # type: ignore
     orchestrator = get_orchestrator()
+
+    if orchestrator.check_saga_exists(order_id):
+        return {
+            "status": "pending",
+            "order_id": order_id,
+            "message": "Saga already in progress.",
+        }, 202
+
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                # Use order_id as idempotency key — prevents double checkout
+                cur.execute(
+                    """INSERT INTO received_events (event_id, event_type)
+                       VALUES (%s, %s)
+                    """,
+                    (order_id, utils.OrderInternalEvent.CHECKOUT_INITIATED)
+                )
+                
+    except psycopg.Error as e:
+        app.logger.error(f"Failed to log checkout event: {e}")
+        return abort(400, DB_ERROR_STR)
+
+    app.logger.info(f"Starting checkout for order: {order_id}")
+
     return orchestrator.run(order_id, order_value)
 
-# @app.post('/checkout/<order_id>')
-# def checkout(order_id: str):
-
-    # order_value: OrderValue = get_order_from_db(order_id)
-    # items_list = [(item_id, qty) for item_id, qty in order_value.items]
-    # if not items_list:
-    #     return abort(400, f"Order: {order_id} has no items!")
-
-    
-    # channel = f"order:saga:{event.correlation_id}"
-
-    # # Subscribe BEFORE sending to Kafka to avoid missing the reply
-    # # if the saga completes faster than we start listening
-    # pubsub = redis_client.pubsub()
-    # pubsub.subscribe(channel)
-    # pubsub.get_message()  # flush the subscribe confirmation message
-
-    
-    # # Poll with a 1s tick until result arrives or deadline is exceeded
-    # result = None
-    # deadline = time.time() + SAGA_TIMEOUT_SECONDS
-
-    # while time.time() < deadline:
-    #     message = pubsub.get_message(timeout=1.0)
-        
-    #     if message and message["type"] == "message":
-    #         app.logger.warning(f"Received message: {message} for order: {order_id} on channel: {channel}")
-            
-
-    #         decoded_event_result = utils.decode_and_type_event(
-    #             utils.RedisMessageWrapper(message["data"])
-    #         )
-
-    #         # If the message states a failure, rollback/return bad result
-    #         if isinstance(decoded_event_result, utils.Failure):
-    #             app.logger.warning(f"Received invalid saga response: {decoded_event_result.error}")
-    #             # TODO Handle failure logic
-    #             result = handle_decoding_error(decoded_event_result)
-    #             break
-            
-    #         if isinstance(decoded_event_result, utils.Success) and decoded_event_result.value.event_type == utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED:
-    #             app.logger.info(f"Saga completed successfully for order: {order_id}")
-    #             result = {
-    #                 "status": "success",
-    #                 "order_id": order_id,
-    #                 "correlation_id": event.correlation_id,
-    #                 "message": "Checkout completed successfully."
-    #             },200
-    #             break
-                
-    #         # If the message is valid and states a success, continue
-    #         handle_event(decoded_event_result.value)
-
-    # pubsub.unsubscribe(channel)
-    # pubsub.close()
-
-    # if result is None:
-    #     app.logger.warning(f"Saga timed out for order: {order_id}, correlation_id: {event.correlation_id}")
-    #     return {
-    #         "status": "timeout",
-    #         "order_id": order_id,
-    #         "correlation_id": event.correlation_id,
-    #         "message": "Saga did not complete in time."
-    #     }, 504
-
-    # else:
-    #     return result
 
 def handle_decoding_error(result: utils.Failure):
     app.logger.error(f"Failed to decode saga response: {result.error}")
@@ -479,7 +464,8 @@ def handle_event(event: utils.BaseEvent):
         trigger_payment(
             correlation_id=correlation_id, 
             order_id=payload.order_id,
-            amount=payload.amount
+            amount=payload.amount,
+            saga_id=event.saga_id
         )
 
     elif event_type == utils.StockIntegrationEvent.STOCK_UNAVAILABLE:
@@ -492,22 +478,24 @@ def handle_event(event: utils.BaseEvent):
         app.logger.info(f"Payment failed for reason: {event.payload.reason}")
         # TODO implement rollback logic
         
-def trigger_payment(correlation_id: str, order_id: str, amount: int):
+def trigger_payment(correlation_id: str, order_id: str, amount: int, saga_id: str):
     """
         Triggered after the stock has been reserved.
     """
-    order_value: OrderValue = get_order_from_db(order_id)
-
+    order_value: OrderValue = get_order_from_db(order_id) # type: ignore
+    
     event = utils.BaseEvent(
         event_type=utils.Commands.START_PAYMENT,
         correlation_id=correlation_id,
+        saga_id = saga_id,
         payload=utils.StartPaymentCommandPayload(
             order_id=order_id,
             user_id=order_value.user_id,
             amount=amount
         )
     )
-    kafka_producer.send(
+
+    kafka_producer.send( # type: ignore
         topic='payment.request',
         value=event
     )
