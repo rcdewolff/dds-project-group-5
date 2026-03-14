@@ -5,11 +5,10 @@ import uuid
 import psycopg # type: ignore
 from psycopg_pool import ConnectionPool # type: ignore
 from psycopg.rows import dict_row # type: ignore
-import threading
-import json as std_json
-from msgspec import Struct, json
+from msgspec import Struct
 from flask import Flask, jsonify, abort, Response
 from services import utils
+from db_repository import PaymentRepository
 
 
 DB_ERROR_STR = "DB error"
@@ -72,44 +71,17 @@ def dispatch_event(event: utils.BaseEvent):
 
 def handle_checkout(event: utils.BaseEvent):
     # Create Query
-    result = remove_user_credit(event.payload.user_id, event.payload.amount)
+    result = remove_user_credit(event)
+
     # print(f"Payment processing result for user: {event.payload.user_id}, order: {event.payload.order_id}: {result}")
     # If valid, emit valid event
     if isinstance(result, utils.Success):
-        new_event = utils.BaseEvent(
-            event_type=utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED,
-            payload=utils.PaymentProcessedPayload(
-                order_id=event.payload.order_id,
-                user_id=event.payload.user_id,
-                amount=event.payload.amount,
-                remaining_credit= result.value
-            ),
-            correlation_id=event.correlation_id,
-            saga_id=event.saga_id
-        )
-
-        kafka_producer.send( # type: ignore
-            topic="order.request",
-            value=new_event
-        )
+        # Log the message and result for debugging
+        print(f"Payment succeeded for user: {event.payload.user_id}, order: {event.payload.order_id}. Remaining credit: {result.value}")
     
     else: 
-        new_event = utils.BaseEvent(
-            event_type=utils.PaymentIntegrationEvent.PAYMENT_FAILED,
-            payload=utils.PaymentFailedPayload(
-                order_id=event.payload.order_id,
-                user_id=event.payload.user_id,
-                amount=event.payload.amount,
-                reason=result.error
-            ),
-            correlation_id=event.correlation_id,
-            saga_id=event.saga_id
-        )
-
-        kafka_producer.send( # type: ignore
-            topic="order.request",
-            value=new_event
-        )
+        print(f"Payment failed for user: {event.payload.user_id}, order: {event.payload.order_id}. Reason: {result.error}")
+        
 
 
 
@@ -119,45 +91,8 @@ def init_db():
     tmp_pool = init_db_pool()
     with tmp_pool.connection() as conn:
         with conn.cursor() as cur:
-            # Append-only event log
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS events (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload JSONB NOT NULL,
-                    version INTEGER NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT now()
-                )
-            """)
-
-            # Lightweight projection (mutable) to make reads efficient while
-            # keeping the events table append-only. 
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_snapshots (
-                    user_id TEXT PRIMARY KEY,
-                    credit INTEGER NOT NULL,
-                    version INTEGER NOT NULL
-                )
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS received_events (
-                    event_id TEXT PRIMARY KEY,
-                    created_at TIMESTAMPTZ DEFAULT now()
-                )
-            """)
-
-            # Implement a table for outbox messages if needed in the future
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS outbox (
-                    id TEXT PRIMARY KEY,
-                    topic TEXT NOT NULL,
-                    payload JSONB NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT now(),
-                    sent BOOLEAN DEFAULT FALSE
-                )
-            """)
+            repo = PaymentRepository(cur)
+            repo.create_tables()
     tmp_pool.close()
 
 def close_db_connection():
@@ -179,21 +114,13 @@ def get_user_from_db(user_id: str) -> UserValue | None:
     try:
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    "SELECT credit, version FROM user_snapshots WHERE user_id = %s",
-                    (user_id,)
-                )
-                row = cur.fetchone()
+                repo = PaymentRepository(cur)
+                row = repo.get_user_snapshot(user_id)
                 if row is not None:                    
                     return UserValue(credit=row['credit'])
             
                 # No snapshot: replay events to reconstruct
-                cur.execute(
-                    "SELECT event_type, payload FROM events WHERE user_id = %s ORDER BY id",
-                    (user_id,)
-                )
-                
-                event_rows = cur.fetchall()
+                event_rows = repo.get_events_for_user(user_id)
                 if not event_rows:
                     abort(400, f"User: {user_id} not found!")
                 
@@ -226,17 +153,11 @@ def create_user():
     try:
         with db_pool.connection() as conn:
             with conn.cursor() as cur:
+                repo = PaymentRepository(cur)
                 # Append creation event and create initial snapshot
                 version = 1
-                payload = std_json.dumps({"credit": 0})
-                cur.execute(
-                    "INSERT INTO events (aggregate_id, event_type, payload, version) VALUES (%s, %s, %s, %s)",
-                    (key, 'USER_CREATED', payload, version)
-                )
-                cur.execute(
-                    "INSERT INTO user_snapshots (user_id, credit, version) VALUES (%s, %s, %s)",
-                    (key, 0, version)
-                )
+                repo.insert_user_event(key, 'USER_CREATED', {"credit": 0}, version)
+                repo.insert_user_snapshot(key, 0, version)
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
@@ -249,18 +170,12 @@ def batch_init_users(n: int, starting_money: int):
     try:
         with db_pool.connection() as conn:
             with conn.cursor() as cur:
+                repo = PaymentRepository(cur)
                 for i in range(n):
                     user_id = f"{i}"
                     version = 1
-                    payload = std_json.dumps({"credit": starting_money})
-                    cur.execute(
-                        "INSERT INTO events (aggregate_id, event_type, payload, version) VALUES (%s, %s, %s, %s)",
-                        (user_id, 'USER_CREATED', payload, version)
-                    )
-                    cur.execute(
-                        "INSERT INTO user_snapshots (user_id, credit, version) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET credit = EXCLUDED.credit, version = EXCLUDED.version",
-                        (user_id, starting_money, version)
-                    )
+                    repo.insert_user_event(user_id, 'USER_CREATED', {"credit": starting_money}, version)
+                    repo.upsert_user_snapshot(user_id, starting_money, version)
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"})
@@ -277,73 +192,153 @@ def find_user(user_id: str):
     )
 
 
-
-
 @app.post('/pay/<user_id>/<amount>')
 def http_remove_credit(user_id: str, amount: int):
-    # Use event-sourced removal to ensure atomic check-and-append semantics
-    result = remove_user_credit(user_id, amount)
+    # Direct HTTP mode: update state and reply immediately without inbox/outbox writes.
+    result = remove_user_credit_direct(user_id, int(amount))
     if isinstance(result, utils.Success):
         return Response(f"User: {user_id} credit updated to: {result.value}", status=200)
     else:
         return abort(400, result.error)
-
-
-
 
 def load_aggregate_state():
     """Load aggregate state from database on startup"""
     # Extract all the events related to 
 
 
-def remove_user_credit(user_id: str, amount: int) -> utils.CreditResult:
-    app.logger.debug(f"Removing {amount} credit from user: {user_id}")
+def remove_user_credit_direct(user_id: str, amount: int):
+    """Synchronous debit path used by HTTP endpoint; no inbox/outbox side effects."""
     MAX_RETRIES = 3
     for attempt in range(MAX_RETRIES):
         try:
             with db_pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # Read WITHOUT lock
-                    cur.execute(
-                        "SELECT credit, version FROM user_snapshots WHERE user_id = %s",
-                        (user_id,)
-                    )
-                    row = cur.fetchone()
+                    repo = PaymentRepository(cur)
+                    row = repo.get_user_snapshot(user_id)
                     if row is None:
                         return utils.Failure(f"User: {user_id} not found")
 
                     current_credit = int(row['credit'])
                     current_version = int(row['version'])
-
                     if current_credit - int(amount) < 0:
                         return utils.Failure("Insufficient credit")
 
                     new_credit = current_credit - int(amount)
                     new_version = current_version + 1
-                    payload = std_json.dumps({"amount": int(amount)})
+                    repo.insert_user_event(user_id, 'FUNDS_DEBITED', {"amount": int(amount)}, new_version)
 
-                    event_id = str(uuid.uuid4())
-                    cur.execute(
-                        "INSERT INTO events (id, user_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-                        (event_id, user_id, 'FUNDS_DEBITED', payload, new_version)
-                    )
+                    if repo.update_user_snapshot_versioned(user_id, new_credit, new_version, current_version):
+                        app.logger.info(f"User: {user_id} credit updated to: {new_credit}")
+                        return utils.Success(new_credit)
 
-                    # Version guard: only succeeds if no one wrote between our read and write
-                    cur.execute(
-                        """UPDATE user_snapshots
-                           SET credit = %s, version = %s
-                           WHERE user_id = %s AND version = %s""",
-                        (new_credit, new_version, user_id, current_version)
-                    )
+                    conn.rollback()
+                    app.logger.warning(f"Version conflict user {user_id}, retry {attempt + 1}/{MAX_RETRIES}")
 
-                    if cur.rowcount == 0:
-                        # Conflict detected — rollback and retry
-                        conn.rollback()
-                        app.logger.warning(f"Version conflict user {user_id}, retry {attempt + 1}/{MAX_RETRIES}")
-                        continue
+        except psycopg.Error as e:
+            app.logger.error(f"Database error: {e}")
+            return utils.Failure(DB_ERROR_STR)
 
-                    app.logger.info(f"User: {user_id} credit updated to: {new_credit}")
-                    return utils.Success(new_credit)
+    return utils.Failure("Too many concurrent updates, please retry")
+
+
+def remove_user_credit(event: utils.BaseEvent) :
+    app.logger.debug(f"Removing {event.payload.amount} credit from user: {event.payload.user_id}")
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            with db_pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    repo = PaymentRepository(cur)
+                    row = repo.get_user_snapshot(event.payload.user_id)
+                    if row is None:
+                        # Write Outbox message for failed payment due to user not found
+                        repo.insert_outbox_message(
+                            topic="order.request",
+                            payload=utils.BaseEvent(
+                                id=str(uuid.uuid4()),
+                                event_type=utils.PaymentIntegrationEvent.PAYMENT_FAILED,
+                                payload=utils.PaymentFailedPayload(
+                                    order_id=event.payload.order_id,  # This would be filled in a real implementation
+                                    user_id=event.payload.user_id,
+                                    amount=event.payload.amount,
+                                    reason="User not found"
+                                ),
+                                order_id=event.payload.order_id,
+                                saga_id = event.saga_id
+                            )
+                        )
+                        return utils.Failure(f"User: {event.payload.user_id} not found")
+
+                    current_credit = int(row['credit'])
+                    current_version = int(row['version'])
+
+                    if current_credit - int(event.payload.amount) < 0:
+                        # Write outbox message for failed payment due to insufficient credit
+                        repo.insert_outbox_message(
+                            topic="order.request",
+                            payload=utils.BaseEvent(
+                                id=str(uuid.uuid4()),
+                                event_type=utils.PaymentIntegrationEvent.PAYMENT_FAILED,
+                                payload=utils.PaymentFailedPayload(
+                                    order_id=event.payload.order_id,  # This would be filled in a real implementation
+                                    user_id=event.payload.user_id,
+                                    amount=event.payload.amount,
+                                    reason="Insufficient credit"
+                                ),
+                                order_id=event.payload.order_id,
+                                saga_id = event.saga_id
+                            )
+                        )
+                        return utils.Failure("Insufficient credit")
+
+                    new_credit = current_credit - int(event.payload.amount)
+                    new_version = current_version + 1
+                    repo.insert_user_event(event.payload.user_id, 'FUNDS_DEBITED', {"amount": int(event.payload.amount)}, new_version)
+
+                    if repo.update_user_snapshot_versioned(event.payload.user_id, new_credit, new_version, current_version):
+                        app.logger.info(f"User: {event.payload.user_id} credit updated to: {new_credit}")
+                        # Write to outbox
+                        repo.insert_outbox_message(
+                            topic="order.request",
+                            payload=utils.BaseEvent(
+                                id=str(uuid.uuid4()),
+                                event_type=utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED,
+                                payload=utils.PaymentProcessedPayload(
+                                    order_id=event.payload.order_id,  # This would be filled in a real implementation
+                                    user_id=event.payload.user_id,
+                                    amount=event.payload.amount,
+                                    remaining_credit=new_credit
+                                ),
+                                order_id=event.payload.order_id,
+                                saga_id = event.saga_id
+                            )
+                        )  
+                        return utils.Success(new_credit)
+                        
+
+                    
+                    # Conflict detected — rollback and retry
+                    conn.rollback()
+                    app.logger.warning(f"Version conflict user {event.payload.user_id}, retry {attempt + 1}/{MAX_RETRIES}")
+                    
+                    if attempt == MAX_RETRIES - 1:
+                    # Write outbox message for failed payment due to version conflict
+                        repo.insert_outbox_message(
+                            topic="order.request",
+                            payload=utils.BaseEvent(
+                                id=str(uuid.uuid4()),
+                                event_type=utils.PaymentIntegrationEvent.PAYMENT_FAILED,
+                                payload=utils.PaymentFailedPayload(
+                                    order_id=event.payload.order_id,  # This would be filled in a real implementation
+                                    user_id=event.payload.user_id,
+                                    amount=event.payload.amount,
+                                    reason="Version conflict, please retry"
+                                ),
+                                order_id=event.payload.order_id,
+                                saga_id = event.saga_id
+                            )
+                        )
+                        
 
         except psycopg.Error as e:
             app.logger.error(f"Database error: {e}")
@@ -359,34 +354,17 @@ def add_credit(user_id: str, amount: int):
         try:
             with db_pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # Read WITHOUT lock
-                    cur.execute(
-                        "SELECT credit, version FROM user_snapshots WHERE user_id = %s",
-                        (user_id,)
-                    )
-                    row = cur.fetchone()
+                    repo = PaymentRepository(cur)
+                    row = repo.get_user_snapshot(user_id)
                     if row is None:
                         return abort(400, f"User: {user_id} not found!")
 
                     new_credit = int(row['credit']) + int(amount)
                     current_version = int(row['version'])
                     new_version = current_version + 1
-                    payload = std_json.dumps({"amount": int(amount)})
+                    repo.insert_user_event(user_id, 'FUNDS_ADDED', {"amount": int(amount)}, new_version)
 
-                    event_id = str(uuid.uuid4())
-                    cur.execute(
-                        "INSERT INTO events (id, user_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-                        (event_id, user_id, 'FUNDS_ADDED', payload, new_version)
-                    )
-
-                    cur.execute(
-                        """UPDATE user_snapshots
-                           SET credit = %s, version = %s
-                           WHERE user_id = %s AND version = %s""",
-                        (new_credit, new_version, user_id, current_version)
-                    )
-
-                    if cur.rowcount == 0:
+                    if not repo.update_user_snapshot_versioned(user_id, new_credit, new_version, current_version):
                         conn.rollback()
                         app.logger.warning(f"Version conflict user {user_id}, retry {attempt + 1}/{MAX_RETRIES}")
                         continue
@@ -404,8 +382,8 @@ def get_users():
     try:
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT user_id, credit FROM user_snapshots")
-                rows = cur.fetchall()
+                repo = PaymentRepository(cur)
+                rows = repo.list_user_snapshots()
                 return jsonify(rows)
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)

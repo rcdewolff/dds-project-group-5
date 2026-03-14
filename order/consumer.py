@@ -25,7 +25,7 @@ def main():
             continue
             
         event = result.value
-        channel = f"{service_name}:saga:{event.correlation_id}"
+        channel = f"{service_name}:saga:{event.saga_id}"
         
         redis_client.publish(channel,message.value)   
         logging.info(f"Forwarded {event.event_type} to Redis channel {channel}")

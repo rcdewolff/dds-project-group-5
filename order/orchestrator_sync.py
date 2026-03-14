@@ -66,7 +66,8 @@ class CheckoutSagaOrchestrator:
         Starts the checkout saga for a given order_id and order details.
         Returns a tuple of (response_dict, http_status_code) to be returned by the Flask endpoint.
         """
-        items_list = [{"item_id": item_id, "qty": qty} for item_id, qty in order_value.items]
+        # Keep item shape consistent with stock handlers and payload structs.
+        items_list = [(item_id, qty) for item_id, qty in order_value.items]
         if not items_list:
             return {"status": "failed", "message": "Order has no items."}, 400
 
@@ -117,7 +118,7 @@ class CheckoutSagaOrchestrator:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """
-                    SELECT status FROM saga_snapshots
+                    SELECT status FROM sagas
                     WHERE order_id = %s AND status IN ('pending', 'running', 'compensating')
                     """,
                     (order_id,)
@@ -141,8 +142,8 @@ class CheckoutSagaOrchestrator:
     ):
         """
         Atomically, in one transaction:
-          1. Append incoming_event to saga_log  — what triggered this (past-tense fact)
-          2. Append outgoing_command to saga_log — what the saga decided (command)
+          1. Append incoming_event to log — what triggered this (past-tense fact)
+          2. Append outgoing_command to log — what the saga decided (command)
           3. Upsert the sagas snapshot
           4. Write the outbox row (if a Kafka command needs to go out)
 
@@ -158,57 +159,57 @@ class CheckoutSagaOrchestrator:
                     if incoming_event:
                         cur.execute(
                             """
-                            INSERT INTO saga_log (id, saga_id, order_id, event_type, payload, created_at)
-                            VALUES (%s, %s, %s, %s, %s, now())
+                            INSERT INTO log (id, order_id, event_type, data, created_at)
+                            VALUES (%s, %s, %s, %s, now())
                             """,
                             (
                                 str(uuid.uuid4()),
-                                context.saga_id,
                                 context.order_id,
                                 incoming_event,
-                                std_json.dumps(incoming_payload) if incoming_payload else None,
+                                std_json.dumps(incoming_payload) if incoming_payload else "{}",
                             ),
                         )
                     # 2. Log the saga decision / outgoing command
                     if outgoing_command:
                         cur.execute(
                             """
-                            INSERT INTO saga_log (id, saga_id, order_id, event_type, payload, created_at)
-                            VALUES (%s, %s, %s, %s, %s, now())
+                            INSERT INTO log (id, order_id, event_type, data, created_at)
+                            VALUES (%s, %s, %s, %s, now())
                             """,
                             (
                                 str(uuid.uuid4()),
-                                context.saga_id,
                                 context.order_id,
                                 outgoing_command,
-                                std_json.dumps(outgoing_payload) if outgoing_payload else None,
+                                std_json.dumps(outgoing_payload) if outgoing_payload else "{}",
                             ),
                         )
                     # 3. Upsert saga snapshot
                     cur.execute(
                         """
-                        INSERT INTO sagas (id, order_id, status, current_step, updated_at)
-                        VALUES (%s, %s, %s, %s, now())
+                        INSERT INTO sagas (id, order_id, status, step, results)
+                        VALUES (%s, %s, %s, %s, %s)
                         ON CONFLICT (id) DO UPDATE
                             SET status = EXCLUDED.status,
-                                current_step = EXCLUDED.current_step,
-                                updated_at = now()
+                                step = EXCLUDED.step,
+                                results = EXCLUDED.results
                         """,
                         (
                             context.saga_id,
                             context.order_id,
                             context.status.value,
                             context.step.value if context.step else None,
+                            std_json.dumps({step.value: value for step, value in context.results.items()}),
                         ),
                     )
                     # 4. Outbox — written atomically so the command is never lost
                     if outbox_topic and outbox_message:
+                        payload_json = std_json.loads(outbox_message.decode())
                         cur.execute(
                             """
                             INSERT INTO outbox (id, topic, payload, created_at)
-                            VALUES (%s, %s, %s, now())
+                            VALUES (%s, %s, %s::jsonb, now())
                             """,
-                            (str(uuid.uuid4()), outbox_topic, outbox_message),
+                            (str(uuid.uuid4()), outbox_topic, std_json.dumps(payload_json)),
                         )
         except psycopg.Error as e:
             logger.error(
@@ -223,10 +224,10 @@ class CheckoutSagaOrchestrator:
         pubsub,
     ) -> tuple:
         deadline = time.time() + self.timeout_seconds
-
+        print(f"Saga [{context.saga_id}] started for order: {context.order_id}, waiting for events...")
         while time.time() < deadline:
             # TODO decrease this loop time if needed
-            message = pubsub.get_message(timeout=1.0)
+            message = pubsub.get_message(timeout=0.01)
             if not message or message["type"] != "message":
                 continue
 
@@ -273,6 +274,7 @@ class CheckoutSagaOrchestrator:
         handlers = {
             utils.StockIntegrationEvent.STOCK_ALLOCATED:    self._on_stock_allocated,
             utils.StockIntegrationEvent.STOCK_UNAVAILABLE:  self._on_stock_unavailable,
+            utils.StockIntegrationEvent.STOCK_FREED:        self._on_stock_freed,
             utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED: self._on_payment_succeeded,
             utils.PaymentIntegrationEvent.PAYMENT_FAILED:   self._on_payment_failed,
         }
@@ -321,8 +323,7 @@ class CheckoutSagaOrchestrator:
     def _on_stock_unavailable(
         self,
         event: utils.BaseEvent,
-        context: SagaContext,
-        order_id: str,
+        context: SagaContext
     ) -> tuple:
         self._transition(
             context=context,
@@ -334,8 +335,7 @@ class CheckoutSagaOrchestrator:
         )
         return {
             "status": "failed",
-            "order_id": order_id,
-            "correlation_id": context.saga_id,
+            "order_id": event.order_id,
             "message": "Stock unavailable.",
         }, 400
 
@@ -343,7 +343,6 @@ class CheckoutSagaOrchestrator:
         self,
         event: utils.BaseEvent,
         context: SagaContext,
-        order_id: str,
     ) -> tuple:
         context.set_result(SagaStep.PAYMENT, {"status": "success"})
         self._transition(
@@ -355,8 +354,7 @@ class CheckoutSagaOrchestrator:
         )
         return {
             "status": "success",
-            "order_id": order_id,
-            "correlation_id": context.saga_id,
+            "order_id": event.order_id,
             "message": "Checkout completed successfully.",
         }, 200
 
@@ -364,9 +362,9 @@ class CheckoutSagaOrchestrator:
         self,
         event: utils.BaseEvent,
         context: SagaContext,
-        order_id: str,
-    ) -> tuple:
+    ) -> Optional[tuple]:
         reason = getattr(event.payload, "reason", "Payment failed.")
+        context.set_result(SagaStep.PAYMENT, {"status": "failure", "reason": reason})
         stock_result = context.get_result(SagaStep.STOCK_RESERVATION)
         comp_order_id = stock_result["order_id"] if stock_result else context.order_id
         topic, outbox_msg = utils.build_free_stock_command(context.saga_id, comp_order_id, context.items)
@@ -381,17 +379,33 @@ class CheckoutSagaOrchestrator:
             outbox_topic=topic,
             outbox_message=outbox_msg,
         )
-        # TX2: mark saga as compensated (fire-and-forget — no response awaited)
+        # Wait for STOCK_FREED before returning failure so compensation is complete.
+        return None
+
+    def _on_stock_freed(
+        self,
+        event: utils.BaseEvent,
+        context: SagaContext,
+    ) -> Optional[tuple]:
+        # STOCK_FREED is only meaningful when we are compensating after payment failure.
+        if context.status != SagaStatus.COMPENSATING:
+            logger.info(f"Saga [{context.saga_id}] received STOCK_FREED outside compensation; ignoring.")
+            return None
+
+        payment_result = context.get_result(SagaStep.PAYMENT) or {}
+        reason = payment_result.get("reason", "Payment failed.")
+
         self._transition(
             context=context,
             new_status=SagaStatus.COMPENSATED,
             new_step=None,
+            incoming_event=utils.StockIntegrationEvent.STOCK_FREED.value,
             outgoing_command=utils.SagaEvents.SAGA_ENDED.value,
+            incoming_payload={"reason": reason},
         )
         return {
             "status": "failed",
-            "order_id": order_id,
-            "correlation_id": context.saga_id,
+            "order_id": event.order_id,
             "message": reason,
         }, 400
 
@@ -412,20 +426,17 @@ class CheckoutSagaOrchestrator:
             return {
                 "status": "failed",
                 "order_id": order_id,
-                "correlation_id": context.saga_id,
                 "message": f"Received unknown event type.",
             }, 400
         if result.error == "EMPTY_MESSAGE":
             return {
                 "status": "failed",
                 "order_id": order_id,
-                "correlation_id": context.saga_id,
                 "message": "Received empty message (tombstone).",
             }, 400
         return {
             "status": "failed",
             "order_id": order_id,
-            "correlation_id": context.saga_id,
             "message": "Unrecognised decode error.",
         }, 500  # unrecognised decode error — keep looping
 

@@ -15,7 +15,9 @@ from services import utils
 from msgspec import json, Struct
 import threading
 from orchestrator_sync import CheckoutSagaOrchestrator
-
+from producer import OutboxRelay
+from gevent import monkey
+monkey.patch_all()
 
 SAGA_TIMEOUT_SECONDS = 30
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -34,6 +36,7 @@ app = Flask("order-service")
 service_name = "order"
 kafka_producer = None
 kafka_consumer = None
+outbox_relay: OutboxRelay | None = None
 _pending_sagas: Dict[str, dict] = {}
 _pending_sagas_lock = threading.Lock()
 
@@ -60,22 +63,6 @@ def init_db_pool():
         reconnect_timeout=30,
         kwargs={"connect_timeout": 10}
     )
-
-
-def consume_messages(consumer):
-    """Background task to process Kafka messages."""
-    print("Kafka consumer started...")
-    for message in consumer:
-        result = utils.decode_and_type_event(message)
-        if isinstance(result, utils.Failure):
-            print(f"Failed to decode message: {result.error}")
-            # TODO Handle validation error response
-
-            continue
-            
-        event = result.value
-        print(f"Received message on topic {message.topic}: {event.event_type}.") 
-        handle_event(event)
 
 
 
@@ -148,8 +135,8 @@ def log_event(event: utils.BaseEvent) -> bool: # type: ignore
     event_details = json.encode(event)
 
     query = """
-        INSERT INTO log (order_id, event_type, data) 
-        VALUES (%s,%s::jsonb,%s)
+        INSERT INTO log (id, order_id, event_type, data)
+        VALUES (%s, %s, %s, %s)
         """
     
     with db_pool.connection() as conn:
@@ -157,10 +144,31 @@ def log_event(event: utils.BaseEvent) -> bool: # type: ignore
             cur.execute(
                 query, 
                 # TODO Make sure this correlation id is right
-                (event.correlation_id, event.event_type,event_details)
+                (str(uuid.uuid4()), event.order_id, event.event_type, event_details.decode())
             )
+
+
+def start_outbox_relay():
+    global outbox_relay
+    if outbox_relay is not None:
+        return
+    if db_pool is None or kafka_producer is None:
+        app.logger.warning("Outbox relay not started: db_pool or kafka_producer not initialized")
+        return
+
+    outbox_relay = OutboxRelay(db_pool=db_pool, kafka_producer=kafka_producer)
+    outbox_relay.start()
+
+
+def stop_outbox_relay():
+    global outbox_relay
+    if outbox_relay is None:
+        return
+    outbox_relay.stop()
+    outbox_relay = None
            
 def close_db_connection():
+    stop_outbox_relay()
     db_pool.close()
 
 
@@ -267,81 +275,24 @@ def find_order(order_id: str):
 def list_routes():
     return {"routes": [str(rule) for rule in app.url_map.iter_rules()]}
 
-@app.get("/test/<service>")
-def test_kafka(service: str):
-    test_msg = "TEST"
-    print(f"Order service testing kafka on {service}...")
-    order_id=str(uuid.uuid4())
 
-    payload = utils.OrderCheckoutPayload(
-        order_id=order_id,
-        items=[]
-    )
-
-    event = utils.BaseEvent.create(
-        event_type="CHECKOUT_INITIATED",
-        payload=payload,
-    )
-
-    print("Sending message via kafka...")
-    try: 
-        kafka_producer.send( # type: ignore
-            topic = f'stock.request',
-            value=event
-        )   
-    except:
-        print("Kafka producer failed...")
-        return {
-            "result":"Server error"
-        }, 500
-    finally:
-        print("Should be fine")
-    # Create a flag event that can be set to true 
-    wait_event = threading.Event()
-    with _pending_sagas_lock:
-        # Save the event using the correlation id
-        _pending_sagas[event.correlation_id] = {
-            "event": wait_event,
-            "result": None
-        }
-
-    kafka_producer.send(topic='stock.request', value=event) # type: ignore
-
-    # Block until Kafka consumer resolves the saga or timeout expires
-    completed = wait_event.wait(timeout=SAGA_TIMEOUT_SECONDS)
-
-    with _pending_sagas_lock:
-        saga_entry = _pending_sagas.pop(event.correlation_id, None)
-    
-    print(f"Saga details: {completed}, {saga_entry}")
-
-    if not completed or saga_entry is None:
-        return {
-            "status": "timeout",
-            "order_id": event.correlation_id,
-            "message": "Saga did not complete in time."
-        }, 504
-
-    result = saga_entry["result"]
-    if result["status"] == "success":
-        return {
-            "status": "success",
-            "correlation_id": event.correlation_id,
-            "message": "Checkout completed successfully."
-        }, 200
-    else:
-        return {
-            "status": "failed",
-            "correlation_id": event.correlation_id,
-            "message": result.get("reason", "Checkout failed.")
-        }, 400
-    
+@app.get("/test/outbox")
+def test_outbox():
+    # read the first 10 events
+    with db_pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT id, topic, payload, sent
+                FROM outbox
+                ORDER BY created_at ASC
+                LIMIT 10
+                """,
+            )
+            rows = cur.fetchall()
+            return jsonify(rows)
 
 
-# TODO Delete this
-def send_post_request(url: str):
-    print('Placeholder')
-    response = None
    
 
 
@@ -392,14 +343,7 @@ def add_item(order_id: str, item_id: str, quantity: int):
         "user_id": order_entry.user_id
     }),200
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
 
-
-def handle_rollback(event: utils.BaseEvent):
-    
-    pass
 
 
 
@@ -416,23 +360,8 @@ def checkout(order_id: str):
             "message": "Saga already in progress.",
         }, 202
 
-    try:
-        with db_pool.connection() as conn:
-            with conn.cursor() as cur:
-                # Use order_id as idempotency key — prevents double checkout
-                cur.execute(
-                    """INSERT INTO received_events (event_id, event_type)
-                       VALUES (%s, %s)
-                    """,
-                    (order_id, utils.OrderInternalEvent.CHECKOUT_INITIATED)
-                )
-                
-    except psycopg.Error as e:
-        app.logger.error(f"Failed to log checkout event: {e}")
-        return abort(400, DB_ERROR_STR)
-
+   
     app.logger.info(f"Starting checkout for order: {order_id}")
-
     return orchestrator.run(order_id, order_value)
 
 
@@ -451,43 +380,21 @@ def handle_decoding_error(result: utils.Failure):
     else:
         return None
 
-def handle_event(event: utils.BaseEvent):
-    event_type = event.event_type
-    correlation_id = event.correlation_id
 
-    if event_type == utils.StockIntegrationEvent.STOCK_ALLOCATED:
-        # log success message
-        app.logger.info("Stock reservation success.")
 
-        # _resolve_saga(correlation_id, {"status": "success"})
-        payload: utils.StockReservedPayload = event.payload
-        trigger_payment(
-            correlation_id=correlation_id, 
-            order_id=payload.order_id,
-            amount=payload.amount,
-            saga_id=event.saga_id
-        )
 
-    elif event_type == utils.StockIntegrationEvent.STOCK_UNAVAILABLE:
-        app.logger.info("Stock reservation failed.")
-        # TODO implement rollback logic if needed (probably not since stock reservation is the first step)
-        
-    
-
-    elif event_type == utils.PaymentIntegrationEvent.PAYMENT_FAILED:
-        app.logger.info(f"Payment failed for reason: {event.payload.reason}")
-        # TODO implement rollback logic
-        
-def trigger_payment(correlation_id: str, order_id: str, amount: int, saga_id: str):
+def trigger_payment(order_id: str, amount: int, saga_id: str):
     """
-        Triggered after the stock has been reserved.
+    Triggered after the stock has been reserved.
+    Uses transactional outbox pattern: inserts the event into the outbox table within the same transaction.
     """
     order_value: OrderValue = get_order_from_db(order_id) # type: ignore
-    
+
     event = utils.BaseEvent(
+        id=str(uuid.uuid4()),
         event_type=utils.Commands.START_PAYMENT,
-        correlation_id=correlation_id,
-        saga_id = saga_id,
+        order_id=order_id,
+        saga_id=saga_id,
         payload=utils.StartPaymentCommandPayload(
             order_id=order_id,
             user_id=order_value.user_id,
@@ -495,11 +402,22 @@ def trigger_payment(correlation_id: str, order_id: str, amount: int, saga_id: st
         )
     )
 
-    kafka_producer.send( # type: ignore
-        topic='payment.request',
-        value=event
-    )
-    app.logger.info(f"Triggered payment for order: {order_id}, correlation_id: {correlation_id}")
+    # Insert into outbox table instead of sending directly to Kafka
+    outbox_query = """
+        INSERT INTO outbox (id, topic, payload)
+        VALUES (%s, %s, %s::jsonb)
+    """
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                outbox_query,
+                (
+                    event.id,
+                    'payment.request',
+                    json.encode(event).decode()
+                )
+            )
+    app.logger.info(f"Payment event for order {order_id} added to outbox")
 
 
     
@@ -511,6 +429,7 @@ def trigger_payment(correlation_id: str, order_id: str, amount: int, saga_id: st
 
 
 if __name__ == '__main__':
+    start_outbox_relay()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')

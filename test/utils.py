@@ -82,6 +82,18 @@ def status_code_is_failure(status_code: int) -> bool:
 
 
 
+
+
+########################################################################################################################
+#   OUTBOX RELAY
+########################################################################################################################
+
+def order_outbox():
+    return requests.get(f"{ORDER_URL}/orders/test/outbox")
+
+
+
+
 def setup_test_environment(items: list[int], credit: int) -> str:
     # Create a user and an associated order
     user_response = create_user()
@@ -204,6 +216,7 @@ def test_saga_failure():
 if __name__ == '__main__':
     # setup_test_environment(2)
     # print_test_data()
-    test_checkout_saga()
+    # test_checkout_saga()
+    print(order_outbox())
 
     # test_add_item_to_order()

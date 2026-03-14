@@ -10,8 +10,8 @@
 #   and the correct waiting coroutine (on any instance) will wake up.
 #
 # Flow per saga:
-#   HTTP handler      subscribes to "order:saga:<correlation_id>"
-#   Kafka consumer    publishes result to "order:saga:<correlation_id>"
+#   HTTP handler      subscribes to "order:saga:<order_id>"
+#   Kafka consumer    publishes result to "order:saga:<order_id>"
 #   HTTP handler      wakes up, reads result, advances or terminates saga
 
 import asyncio

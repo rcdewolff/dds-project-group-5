@@ -36,7 +36,7 @@ class SagaContext:
     status: SagaStatus
     order_id: str
     user_id: str
-    items: List[dict[str, int]]
+    items: List[tuple[str, int]]
     results: Dict[SagaStep, Any] = field(default_factory=dict)  # ← key by step, not string
     
     def set_result(self, step: SagaStep, result: Any):

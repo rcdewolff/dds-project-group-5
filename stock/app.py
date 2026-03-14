@@ -2,17 +2,17 @@ import logging
 import os
 import atexit
 import uuid
-import json as std_json
 
 import psycopg # type: ignore
 from psycopg_pool import ConnectionPool # type: ignore
 from psycopg.rows import dict_row # type: ignore
+from collections import defaultdict
 
-from msgspec import Struct
-from flask import Flask, jsonify, abort, Response
-
+from msgspec import Struct, json
 from flask import Flask, jsonify, abort, Response
 from services import utils
+from db_repository import StockRepository
+
 
 DB_ERROR_STR = "DB error"
 
@@ -53,45 +53,8 @@ def init_db():
     tmp_pool = init_db_pool()
     with tmp_pool.connection() as conn:
         with conn.cursor() as cur:
-            # Append-only event log
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS log (
-                    id TEXT PRIMARY KEY,
-                    item_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload JSONB NOT NULL,
-                    version INTEGER NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT now()
-                )
-            """)
-            # Mutable snapshot/projection for fast reads
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS item_snapshots (
-                    item_id TEXT PRIMARY KEY,
-                    stock INTEGER NOT NULL,
-                    price INTEGER NOT NULL,
-                    version INTEGER NOT NULL
-                )
-            """)
-
-            # Implement a received table for idempotency if needed in the future
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS received_events (
-                    event_id TEXT PRIMARY KEY,
-                    created_at TIMESTAMPTZ DEFAULT now()
-                )
-            """)
-
-            # Implement a table for outbox messages if needed in the future
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS outbox (
-                    id TEXT PRIMARY KEY,
-                    topic TEXT NOT NULL,
-                    payload JSONB NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT now(),
-                    sent BOOLEAN DEFAULT FALSE
-                )
-            """)
+            repo = StockRepository(cur)
+            repo.create_tables()
 
             
     tmp_pool.close()
@@ -115,21 +78,14 @@ def get_item_from_db(item_id: str) -> StockValue | None:
     try:
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    "SELECT stock, price FROM item_snapshots WHERE item_id = %s",
-                    (item_id,)
-                )
-                row = cur.fetchone()
+                repo = StockRepository(cur)
+                row = repo.get_item_snapshot(item_id)
 
                 if row is not None:
                     return StockValue(stock=row['stock'], price=row['price'])
 
                 # Fallback: replay events to rebuild state
-                cur.execute(
-                    "SELECT event_type, payload FROM log WHERE item_id = %s ORDER BY version",
-                    (item_id,)
-                )
-                event_rows = cur.fetchall()
+                event_rows = repo.get_log_events_for_item(item_id)
                 if not event_rows:
                     abort(400, f"Item: {item_id} not found!")
 
@@ -159,7 +115,16 @@ def consume_messages(consumer):
         result = utils.decode_and_type_event(message)
         if isinstance(result, utils.Failure):
             print(f"Failed to decode message: {result.error}")
-            # TODO Handle validation error response in a decent way
+            # Write to outbox
+            with db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    repo = StockRepository(cur)
+                    error_event = utils.build_generic_error_event(
+                        order_id=str(uuid.uuid4()),
+                        saga_id=str(uuid.uuid4()),
+                        error_message=f"Failed to decode message: {result.error}",
+                    )
+                    repo.insert_outbox_message('order.request', error_event)
             continue
             
         event = result.value
@@ -167,8 +132,9 @@ def consume_messages(consumer):
 
         if isinstance(is_already_processed(event), utils.Success):
             print(f"Event {event.saga_id} already processed, skipping.")
-            
+            handle_already_processed(event)
             continue
+            
 
         dispatch_event(event)
             
@@ -176,22 +142,19 @@ def consume_messages(consumer):
 def is_already_processed(event: utils.BaseEvent):
     with db_pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            # Check if event was already processed
-            cur.execute(
-                "SELECT event_id FROM received_events WHERE event_id = %s",
-                (event.saga_id,)
-            )
-            if cur.fetchone() is not None:
+            repo = StockRepository(cur)
+            if repo.received_event_exists(event.id):
                 return utils.Success(0)  # Already processed, skip
             
-            # Mark event as processed
-            cur.execute(
-                "INSERT INTO received_events (event_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                (event.saga_id,)
-            )
+            # Mark event as received for idempotency
+            repo.insert_received_event(event.id)
 
 
-def dispatch_event(event: utils.BaseEvent):
+def dispatch_event(event: utils.BaseEvent, already_processed=False):
+
+    if already_processed:
+        handle_already_processed(event)
+        return
 
     if event.event_type == utils.Commands.RESERVE_STOCK:
         handle_stock_reservation(event)
@@ -200,52 +163,60 @@ def dispatch_event(event: utils.BaseEvent):
 
 
 
+def handle_already_processed(event: utils.BaseEvent):
+    """
+    Handle events that have already been processed.
+    """
+    # Extract the result from the received_events table and resend the appropriate response based on the event type
+    with db_pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            repo = StockRepository(cur)
+            result = repo.get_received_event_result(event.id)
+
+            # FIXME This should not happen, but we log it just in case to investigate potential issues with the idempotency mechanism
+            if result is None:
+                app.logger.error(f"Event {event.saga_id} marked as processed but no result found in DB")
+                return
+
+            if event.event_type == utils.Commands.RESERVE_STOCK:
+                if result.get('status') == 'success':
+                    response_event = utils.build_stock_allocated_event(
+                        saga_id=event.saga_id,
+                        order_id=event.payload.order_id,
+                        amount=result.get('amount', 0),
+                    )
+                else:
+                    response_event = utils.build_stock_unavailable_event(
+                        saga_id=event.saga_id,
+                        order_id=event.payload.order_id,
+                    )
+
+                # write to outbox
+                repo.insert_outbox_message('order.request', response_event)
+                app.logger.info(f"Resent response for already processed event {event.saga_id}: {response_event.event_type}")
+            
 
 def handle_stock_reservation(event: utils.BaseEvent):
    
     payload = event.payload
     print(f"Handling stock reservation for order: {payload.order_id} with items: {payload.items}")
 
-    result = subtract_stock_batch(payload.order_id, payload.items, event.correlation_id)
+    result = subtract_stock_batch(payload.order_id, payload.items, event.id, event.saga_id)
     
     if isinstance(result, utils.Success):
-        print(f"Stock successfully reserved for order: {payload.order_id}")
-        event = utils.BaseEvent(
-            utils.StockIntegrationEvent.STOCK_ALLOCATED,
-            correlation_id=event.correlation_id,
-            saga_id=event.saga_id,
-            payload=utils.StockReservedPayload(
-                order_id=payload.order_id,
-                amount=result.value
-            )
-        )
-
-        kafka_producer.send( # type: ignore
-            topic='order.request',
-            value=event)
-
+        app.logger.info(f"Stock reservation successful for order {payload.order_id}, total cost: {result.value}")
     else:
-        print(f"Failed to reserve stock for order: {payload.order_id}. Reason: {result.error}")
-        event = utils.BaseEvent(
-            utils.StockIntegrationEvent.STOCK_UNAVAILABLE,
-            correlation_id=event.correlation_id,
-            saga_id=event.saga_id,
-            # TODO Add more info in the payload about the failure (e.g. which items were unavailable)
-            payload=utils.StockUnavailablePayload(
-                order_id=payload.order_id
-            )
-        )
-
-        kafka_producer.send( # type: ignore
-            topic='order.request',
-            value=event
-        )
+        app.logger.info(f"Stock reservation failed for order {payload.order_id}, reason: {result.error}")
     
 
 def handle_rollback(event: utils.BaseEvent):
 
     order_id = event.payload.order_id
-    items = sorted(event.payload.items, key=lambda x: x[0])  # ← add this
+    qty_by_item: dict[str, int] = defaultdict(int)
+    for item_id, qty in event.payload.items:
+        qty_by_item[item_id] += int(qty)
+
+    items = sorted(qty_by_item.items(), key=lambda x: x[0])
     print(f"Handling stock rollback for order: {order_id}")
     MAX_RETRIES = 3
 
@@ -253,13 +224,9 @@ def handle_rollback(event: utils.BaseEvent):
         try:
             with db_pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
+                    repo = StockRepository(cur)
                     item_ids = [item_id for item_id, _ in items]
-                    placeholders = ','.join(['%s'] * len(item_ids))
-                    cur.execute(
-                        f"SELECT item_id, stock, version FROM item_snapshots WHERE item_id IN ({placeholders})",
-                        item_ids
-                    )
-                    rows = {row['item_id']: row for row in cur.fetchall()}
+                    rows = repo.get_item_snapshots_for_ids(item_ids)
 
                     conflict = False
                     for item_id, qty in items:
@@ -270,23 +237,17 @@ def handle_rollback(event: utils.BaseEvent):
                         current_version = int(row['version'])
                         new_stock = int(row['stock']) + int(qty)
                         new_version = current_version + 1
-
-                        ev_id = str(uuid.uuid4())
-                        payload_str = std_json.dumps({"order_id": order_id, "amount": int(qty)})
-                        cur.execute(
-                            "INSERT INTO log (id, item_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-                            (ev_id, item_id, 'STOCK_ADDED', payload_str, new_version)
+                        app.logger.info(f"Rolling back stock for item {item_id}: adding back {qty} to stock {row['stock']} => new stock = {new_stock} (version {current_version})")
+                        repo.insert_log_event(
+                            item_id=item_id,
+                            event_type='STOCK_ADDED',
+                            payload={"order_id": order_id, "amount": int(qty)},
+                            version=new_version,
                         )
-
-                        cur.execute(
-                            """UPDATE item_snapshots
-                               SET stock = %s, version = %s
-                               WHERE item_id = %s AND version = %s""",
-                            (new_stock, new_version, item_id, current_version)
-                        )
-
-                        if cur.rowcount == 0:          # ← check HERE, immediately after the version guard
+                        
+                        if not repo.update_snapshot_versioned(item_id, new_stock, new_version, current_version):
                             conflict = True
+                            app.logger.info(f"Version conflict during stock rollback for item {item_id} in order {order_id}")
                             break
 
                     if conflict:
@@ -295,14 +256,13 @@ def handle_rollback(event: utils.BaseEvent):
                         continue
 
                     print(f"Stock rollback completed for order: {order_id}")
-                    rollback_event = utils.BaseEvent(
-                        utils.StockIntegrationEvent.STOCK_FREED,
-                        correlation_id=event.correlation_id,
+                    rollback_event = utils.build_stock_freed_event(
                         saga_id=event.saga_id,
-                        payload=utils.StockFreedPayload(order_id=order_id)
+                        order_id=order_id,
                     )
 
-                    kafka_producer.send(topic='order.request', value=rollback_event) # type: ignore
+                    # Write to the outbox
+                    repo.insert_outbox_message('order.request', rollback_event)
                     return
 
         except psycopg.Error as e:
@@ -314,13 +274,7 @@ def handle_rollback(event: utils.BaseEvent):
 
 
 
-
-
-
-
-
-
-def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: str):
+def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: str, saga_id: str):
     if not items:
         return utils.Failure("No items to reserve")
 
@@ -330,18 +284,15 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: 
         try:
             with db_pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
+                    repo = StockRepository(cur)
                     # Read all items WITHOUT lock
                     item_ids = [item_id for item_id, _ in items]
-                    placeholders = ','.join(['%s'] * len(item_ids))
-                    cur.execute(
-                        f"SELECT item_id, stock, price, version FROM item_snapshots WHERE item_id IN ({placeholders})",
-                        item_ids
-                    )
-                    rows = {row['item_id']: row for row in cur.fetchall()}
+                    rows = repo.get_item_snapshots_for_ids(item_ids, include_price=True)
 
                     # Check that all items exist
                     missing = [iid for iid, _ in items if iid not in rows]
                     if missing:
+                        
                         return utils.Failure(f"Items not found: {missing}")
 
                     # Check availability before writing anything
@@ -350,6 +301,14 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: 
                         if int(rows[iid]['stock']) < int(qty)
                     ]
                     if unavailable:
+                        # write to outbox
+                        repo.insert_outbox_message(
+                            'order.request',
+                            utils.build_stock_unavailable_event(
+                                saga_id=saga_id,
+                                order_id=order_id,
+                            ),
+                        )
                         return utils.Failure(f"Insufficient stock for items: {unavailable}")
 
                     # Write phase: version-guarded update for every item
@@ -362,39 +321,67 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: 
                         new_version = current_version + 1
                         price = int(row['price'])
 
-                        ev_id = str(uuid.uuid4())
-                        payload_str = std_json.dumps({"order_id": order_id, "amount": int(qty)})
-                        cur.execute(
-                            "INSERT INTO log (id, item_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-                            (ev_id, item_id, 'STOCK_SUBTRACTED', payload_str, new_version)
+                        repo.insert_log_event(
+                            item_id=item_id,
+                            event_type='STOCK_SUBTRACTED',
+                            payload={"order_id": order_id, "amount": int(qty)},
+                            version=new_version,
                         )
 
-                        # Version guard: only succeeds if no one else wrote first
-                        cur.execute(
-                            """UPDATE item_snapshots
-                               SET stock = %s, version = %s
-                               WHERE item_id = %s AND version = %s""",
-                            (new_stock, new_version, item_id, current_version)
-                        )
-
-                        if cur.rowcount == 0:
+                        if not repo.update_snapshot_versioned(item_id, new_stock, new_version, current_version):
                             conflict = True
                             break
-                        
-                        
 
                         total_cost += price * int(qty)
 
-                    if conflict:
-                        conn.rollback()
-                        app.logger.warning(f"Version conflict in batch stock update, retry {attempt + 1}/{MAX_RETRIES}")
-                        continue
+                    if not conflict:
+                        # Log the successful reservation in the received_events table for idempotency
+                        repo.set_received_event_result(
+                            event_id=event_id,
+                            status='PROCESSED',
+                            result={"status": "success", "amount": total_cost},
+                        )
+                        
+                        # log to outbox
+                        repo.insert_outbox_message(
+                            'order.request',
+                            utils.build_stock_allocated_event(
+                                saga_id=saga_id,
+                                order_id=order_id,
+                                amount=total_cost,
+                            ),
+                        )
 
-                    return utils.Success(total_cost)
+                        return utils.Success(total_cost)
+                    
+                    
+                    conn.rollback()
+                    app.logger.warning(f"Version conflict in batch stock update, retry {attempt + 1}/{MAX_RETRIES}")
+                    
+                    # TODO Add option for transient failure (RETRYABLE_FAILURE in case of max retry reached)
+                    if attempt == MAX_RETRIES - 1:
+                        # Log the failure in the received_events table for idempotency
+                        repo.set_received_event_result(
+                            event_id=event_id,
+                            status='PROCESSED',
+                            result={"status": "failure", "reason": "version conflict"},
+                        )
+
+                        repo.insert_outbox_message(
+                            'order.request',
+                            utils.build_stock_unavailable_event(
+                                saga_id=event_id,
+                                order_id=order_id,
+                            ),
+                        )
+
+                    
 
         except psycopg.Error as e:
             app.logger.error(f"Stock subtraction failed: {e}")
             return utils.Failure("Database error during stock subtraction")
+
+    # Write failure on outbox
 
     return utils.Failure("Too many concurrent updates, please retry")
 
@@ -405,16 +392,14 @@ def create_item(price: int):
     try:
         with db_pool.connection() as conn:
             with conn.cursor() as cur:
-                event_id = str(uuid.uuid4())
-                payload_str = std_json.dumps({"price": int(price), "stock": 0})
-                cur.execute(
-                    "INSERT INTO log (id, item_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-                    (event_id, key, 'ITEM_CREATED', payload_str, 1)
+                repo = StockRepository(cur)
+                repo.insert_log_event(
+                    item_id=key,
+                    event_type='ITEM_CREATED',
+                    payload={"price": int(price), "stock": 0},
+                    version=1,
                 )
-                cur.execute(
-                    "INSERT INTO item_snapshots (item_id, stock, price, version) VALUES (%s, %s, %s, %s)",
-                    (key, 0, int(price), 1)
-                )
+                repo.insert_item_snapshot(key, 0, int(price), 1)
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
@@ -424,11 +409,10 @@ def create_item(price: int):
 def get_items():
     with db_pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT item_id, stock, price FROM item_snapshots")
-            items = cur.fetchall()
+            repo = StockRepository(cur)
+            items = repo.list_item_snapshots()
             return jsonify(items)
     
-
 
 @app.post('/batch_init/<n>/<starting_stock>/<item_price>')
 def batch_init_users(n: int, starting_stock: int, item_price: int):
@@ -438,19 +422,16 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
     try:
         with db_pool.connection() as conn:
             with conn.cursor() as cur:
+                repo = StockRepository(cur)
                 for i in range(n):
                     item_id = str(i)
-                    event_id = str(uuid.uuid4())
-                    payload_str = std_json.dumps({"stock": starting_stock, "price": item_price})
-                    cur.execute(
-                        "INSERT INTO " \
-                        "log (id, item_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-                        (event_id, item_id, 'ITEM_CREATED', payload_str, 1)
+                    repo.insert_log_event(
+                        item_id=item_id,
+                        event_type='ITEM_CREATED',
+                        payload={"stock": starting_stock, "price": item_price},
+                        version=1,
                     )
-                    cur.execute(
-                        "INSERT INTO item_snapshots (item_id, stock, price, version) VALUES (%s, %s, %s, %s)",
-                        (item_id, starting_stock, item_price, 1)
-                    )
+                    repo.insert_item_snapshot(item_id, starting_stock, item_price, 1)
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
@@ -473,12 +454,8 @@ def add_stock(item_id: str, amount: int):
         try:
             with db_pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # Read WITHOUT lock
-                    cur.execute(
-                        "SELECT stock, version FROM item_snapshots WHERE item_id = %s",
-                        (item_id,)
-                    )
-                    row = cur.fetchone()
+                    repo = StockRepository(cur)
+                    row = repo.get_item_snapshot(item_id)
                     if row is None:
                         return abort(400, f"Item: {item_id} not found!")
 
@@ -486,22 +463,14 @@ def add_stock(item_id: str, amount: int):
                     new_stock = int(row['stock']) + int(amount)
                     new_version = current_version + 1
 
-                    event_id = str(uuid.uuid4())
-                    payload_str = std_json.dumps({"amount": int(amount)})
-                    cur.execute(
-                        "INSERT INTO log (id, item_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-                        (event_id, item_id, 'STOCK_ADDED', payload_str, new_version)
+                    repo.insert_log_event(
+                        item_id=item_id,
+                        event_type='STOCK_ADDED',
+                        payload={"amount": int(amount)},
+                        version=new_version,
                     )
 
-                    # Version guard
-                    cur.execute(
-                        """UPDATE item_snapshots
-                           SET stock = %s, version = %s
-                           WHERE item_id = %s AND version = %s""",
-                        (new_stock, new_version, item_id, current_version)
-                    )
-
-                    if cur.rowcount == 0:
+                    if not repo.update_snapshot_versioned(item_id, new_stock, new_version, current_version):
                         conn.rollback()
                         app.logger.warning(f"Version conflict for item {item_id}, retry {attempt + 1}/{MAX_RETRIES}")
                         continue
@@ -521,12 +490,8 @@ def remove_stock(item_id: str, amount: int):
         try:
             with db_pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # Read WITHOUT lock
-                    cur.execute(
-                        "SELECT stock, version FROM item_snapshots WHERE item_id = %s",
-                        (item_id,)
-                    )
-                    row = cur.fetchone()
+                    repo = StockRepository(cur)
+                    row = repo.get_item_snapshot(item_id)
                     if row is None:
                         return abort(400, f"Item: {item_id} not found!")
 
@@ -539,22 +504,14 @@ def remove_stock(item_id: str, amount: int):
 
                     new_version = current_version + 1
 
-                    event_id = str(uuid.uuid4())
-                    payload_str = std_json.dumps({"amount": int(amount)})
-                    cur.execute(
-                        "INSERT INTO log (id, item_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-                        (event_id, item_id, 'STOCK_SUBTRACTED', payload_str, new_version)
+                    repo.insert_log_event(
+                        item_id=item_id,
+                        event_type='STOCK_SUBTRACTED',
+                        payload={"amount": int(amount)},
+                        version=new_version,
                     )
 
-                    # Version guard
-                    cur.execute(
-                        """UPDATE item_snapshots
-                           SET stock = %s, version = %s
-                           WHERE item_id = %s AND version = %s""",
-                        (new_stock, new_version, item_id, current_version)
-                    )
-
-                    if cur.rowcount == 0:
+                    if not repo.update_snapshot_versioned(item_id, new_stock, new_version, current_version):
                         conn.rollback()
                         app.logger.warning(f"Version conflict for item {item_id}, retry {attempt + 1}/{MAX_RETRIES}")
                         continue

@@ -12,4 +12,5 @@ def post_fork(server, worker):
     # Producer only — consumer lives in its own process now
     order_kafka = kafka_client.Client(app.service_name, [])
     app.kafka_producer = order_kafka.producer
+    app.start_outbox_relay()
 

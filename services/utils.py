@@ -40,20 +40,22 @@ class BaseEvent(Struct, Generic[J]):
     A generic event envelope that can wrap any payload type. 
     Useful for Kafka messages where we want a consistent structure but variable payloads.
     """
+    id: str
     event_type: str
-    correlation_id: str
+    order_id: str
     payload: J
     saga_id: str
 
     timestamp: float = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
     @classmethod
-    def create(cls, event_type: str, payload: J, corr_id: str = "", saga_id: str = ""):
+    def create(cls, event_type: str, payload: J, order_id: str = "", saga_id: str = "" , id:str = ""):
         return cls(
             event_type=event_type,
             payload=payload,
-            correlation_id=corr_id or str(uuid.uuid4()),
-            saga_id=saga_id or str(uuid.uuid4())
+            order_id=order_id,
+            saga_id=saga_id,
+            id=id or str(uuid.uuid4())
         )
 
 
@@ -80,7 +82,7 @@ class ReserveStockCommandPayload(Struct):
     Payload for a reserve stock command event.
     """
     order_id: str
-    items: list[dict[str,int]]
+    items: list[tuple[str, int]]
 
 class StockUnavailablePayload(Struct):
     """
@@ -110,7 +112,7 @@ class FreeStockCommandPayload(Struct):
     Payload for a free stock command event.
     """
     order_id: str
-    items: list[dict[str,int]]
+    items: list[tuple[str, int]]
 
 
 class PaymentProcessedPayload(Struct):
@@ -138,7 +140,9 @@ class CheckoutPayload(Struct):
     user_id: str
 
 
-
+class EventStatus(StrEnum):
+    RECEIVED = "RECEIVED"
+    PROCESSED = "PROCESSED"
 
 class Commands(StrEnum):
     RESERVE_STOCK = "reserve_stock"
@@ -147,15 +151,12 @@ class Commands(StrEnum):
     START_PAYMENT = "start_payment"
     ROLLBACK_PAYMENT = "rollback_payment"
 
-
-
 class OrderInternalEvent(StrEnum):
     ORDER_CREATED = "order_created"
     ITEM_ADDED = "item_added"
     CHECKOUT_INITIATED = "checkout_initiated"
     ORDER_CANCELLED = "order_cancelled"
     ORDER_COMPLETED = "order_completed"
-
 
 class SagaEvents(StrEnum):
     # Lifecycle
@@ -166,7 +167,6 @@ class SagaEvents(StrEnum):
     # Steps — status field carries PENDING/SUCCESS/FAILED/COMPENSATING/COMPENSATED
     STOCK_RESERVATION = "saga.stock"
     PAYMENT           = "saga.payment"
-
 
 class PaymentInternalEvent(StrEnum):
     USER_CREATED = "user_created"
@@ -179,7 +179,6 @@ class StockInternalEvent(StrEnum):
     STOCK_INCREMENTED = "stock_incremented"
     STOCK_DECREMENTED = "stock_decremented"
     STOCK_RESERVED = "stock_reserved"
-
 
 class OrderIntegrationEvent(StrEnum):
     # Triggered by /orders/checkout/{order_id}
@@ -207,13 +206,15 @@ class StockIntegrationEvent(StrEnum):
 
 PAYLOAD_REGISTRY: dict[str, type] = {
 
-    Commands.RESERVE_STOCK: OrderCheckoutPayload,
-    Commands.FREE_STOCK: OrderCheckoutPayload,
+    Commands.RESERVE_STOCK: ReserveStockCommandPayload,
+    Commands.FREE_STOCK: FreeStockCommandPayload,
 
     Commands.START_PAYMENT: StartPaymentCommandPayload,
 
     StockIntegrationEvent.STOCK_ALLOCATED: StockReservedPayload,
     StockIntegrationEvent.STOCK_UNAVAILABLE: StockUnavailablePayload,
+    StockIntegrationEvent.STOCK_FREED: StockFreedPayload,
+
     PaymentIntegrationEvent.PAYMENT_SUCCEEDED: PaymentProcessedPayload,
     PaymentIntegrationEvent.PAYMENT_FAILED: PaymentFailedPayload
 }
@@ -246,8 +247,9 @@ def decode_and_type_event(record: Any) -> DecodeResult:
         # Return new instance with the typed payload
         return Success(
             value = BaseEvent (
+                id=envelope.id,
                 event_type=envelope.event_type,
-                correlation_id=envelope.correlation_id,
+                order_id=envelope.order_id,
                 payload=typed_payload,
                 timestamp=envelope.timestamp,
                 saga_id=envelope.saga_id
@@ -270,10 +272,20 @@ class RedisMessageWrapper:
         self.value = data.encode() if isinstance(data, str) else data
 
 
-def build_reserve_stock_command(saga_id: str, order_id: str, items: list) -> tuple[str, bytes]:
+def build_generic_error_event(order_id: str, saga_id: str, error_message: str) -> BaseEvent[dict]:
+    return BaseEvent(
+        id=str(uuid.uuid4()),
+        event_type="error",
+        order_id=order_id,
+        saga_id=saga_id,
+        payload={"error": error_message},
+    )
+
+def build_reserve_stock_command(saga_id: str, order_id: str, items: list[tuple[str, int]]) -> tuple[str, bytes]:
     event = BaseEvent(
+        id=str(uuid.uuid4()),
         event_type=Commands.RESERVE_STOCK,
-        correlation_id=order_id,
+        order_id=order_id,
         saga_id=saga_id,
         payload=ReserveStockCommandPayload(order_id=order_id, items=items),
     )
@@ -281,18 +293,50 @@ def build_reserve_stock_command(saga_id: str, order_id: str, items: list) -> tup
 
 def build_start_payment_command(saga_id: str, order_id: str, user_id: str, amount: int) -> tuple[str, bytes]:
     event = BaseEvent(
+        id=str(uuid.uuid4()),
         event_type=Commands.START_PAYMENT,
-        correlation_id=order_id,
+        order_id=order_id,
         saga_id=saga_id,
         payload=StartPaymentCommandPayload(order_id=order_id, user_id=user_id, amount=amount),
     )
     return "payment.request", json.encode(event)
 
-def build_free_stock_command(saga_id: str, order_id: str, items: list) -> tuple[str, bytes]:
+def build_free_stock_command(saga_id: str, order_id: str, items: list[tuple[str, int]]) -> tuple[str, bytes]:
     event = BaseEvent(
+        id=str(uuid.uuid4()),
         event_type=Commands.FREE_STOCK,
-        correlation_id=order_id,
+        order_id=order_id,
         saga_id=saga_id,
         payload=FreeStockCommandPayload(order_id=order_id, items=items),
     )
     return "stock.request", json.encode(event)
+
+
+def build_stock_allocated_event(order_id: str, saga_id: str, amount: int) -> BaseEvent[StockReservedPayload]:
+    return BaseEvent(
+        id=str(uuid.uuid4()),
+        event_type=StockIntegrationEvent.STOCK_ALLOCATED,
+        order_id=order_id,
+        saga_id=saga_id,
+        payload=StockReservedPayload(order_id=order_id, amount=amount),
+    )
+
+
+def build_stock_unavailable_event(saga_id: str, order_id: str) -> BaseEvent[StockUnavailablePayload]:
+    return BaseEvent(
+        id=str(uuid.uuid4()),
+        event_type=StockIntegrationEvent.STOCK_UNAVAILABLE,
+        order_id=order_id,
+        saga_id=saga_id,
+        payload=StockUnavailablePayload(order_id=order_id),
+    )
+
+
+def build_stock_freed_event(order_id: str, saga_id: str) -> BaseEvent[StockFreedPayload]:
+    return BaseEvent(
+        id=str(uuid.uuid4()),
+        event_type=StockIntegrationEvent.STOCK_FREED,
+        order_id=order_id,
+        saga_id=saga_id,
+        payload=StockFreedPayload(order_id=order_id),
+    )

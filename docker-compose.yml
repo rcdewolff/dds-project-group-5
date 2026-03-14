@@ -32,12 +32,24 @@ services:
       - ./order:/home/flask-app/
       - ./services:/home/flask-app/services
     image: order:latest
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/routes', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     environment:
       - GATEWAY_URL=http://gateway:80
       - PYTHONUNBUFFERED=1
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 10 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     env_file:
       - env/order_citus.env
       - env/kafka_settings.env
@@ -69,6 +81,27 @@ services:
       kafka:
         condition: service_healthy
       redis:
+        condition: service_healthy
+
+  order-producer:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OUTBOX_POLL_INTERVAL=0.5
+    command: python producer.py
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      order-service:
         condition: service_healthy
 
   order-citus-db:
@@ -103,6 +136,18 @@ services:
       - ./stock:/home/flask-app/
       - ./services:/home/flask-app/services
     image: stock:latest
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/items', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     env_file:
       - env/stock_citus.env
@@ -115,7 +160,27 @@ services:
       redis:
         condition: service_healthy
 
-  
+  stock-producer:
+    build: ./stock
+    volumes:
+      - ./stock:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: stock:latest
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OUTBOX_POLL_INTERVAL=0.5
+    command: python producer.py
+    env_file:
+      - env/stock_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      stock-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+
   stock-citus-db:
     image: citusdata/citus:13.0
     environment:
@@ -144,6 +209,18 @@ services:
       - ./payment:/home/flask-app/
       - ./services:/home/flask-app/services
     image: payment:latest
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/users', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     environment:
       - PYTHONUNBUFFERED=1
@@ -158,6 +235,27 @@ services:
       kafka:
         condition: service_healthy
       redis:
+        condition: service_healthy
+
+  payment-producer:
+    build: ./payment
+    volumes:
+      - ./payment:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: payment:latest
+    command: python producer.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OUTBOX_POLL_INTERVAL=0.5
+    env_file:
+      - env/payment_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      payment-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      payment-service:
         condition: service_healthy
   payment-citus-db:
     image: citusdata/citus:13.0
