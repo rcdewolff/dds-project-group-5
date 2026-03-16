@@ -16,8 +16,6 @@ from msgspec import json, Struct
 import threading
 from orchestrator_sync import CheckoutSagaOrchestrator
 from producer import OutboxRelay
-from gevent import monkey
-monkey.patch_all()
 
 SAGA_TIMEOUT_SECONDS = 30
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")

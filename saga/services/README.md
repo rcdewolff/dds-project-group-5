@@ -50,7 +50,7 @@ def post_fork(server, worker):
 ```
 
 ### 4. Setup
-If you want to change imports, modify `setup.py` and run the command `pip install -e ./kafka_service`
+If you want to change imports, modify `setup.py` and run the command `pip install -e ./services`
 
 ---
 ## Events
