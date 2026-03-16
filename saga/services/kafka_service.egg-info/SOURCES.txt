@@ -1,0 +1,5 @@
+setup.py
+kafka_service.egg-info/PKG-INFO
+kafka_service.egg-info/SOURCES.txt
+kafka_service.egg-info/dependency_links.txt
+kafka_service.egg-info/top_level.txt

@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Localhost:5000 API Manager</title>
+    <style>
+        :root { --primary: #2563eb; --bg: #f8fafc; --panel: #ffffff; }
+        body { font-family: system-ui, sans-serif; background: var(--bg); margin: 0; padding: 20px; color: #1e293b; }
+        .grid-layout { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+        .card { background: var(--panel); border-radius: 8px; border: 1px solid #e2e8f0; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        h2 { margin: 0 0 1rem 0; font-size: 1.1rem; border-bottom: 2px solid #f1f5f9; padding-bottom: 5px; }
+        .form-group { margin-bottom: 1rem; }
+        input { width: calc(100% - 16px); padding: 8px; margin: 4px 0; border: 1px solid #cbd5e1; border-radius: 4px; }
+        button { width: 100%; padding: 8px; cursor: pointer; border: none; border-radius: 4px; background: var(--primary); color: white; font-weight: bold; margin-top: 5px; }
+        button.secondary { background: #64748b; }
+        pre { background: #1e1e1e; color: #4ade80; padding: 1rem; border-radius: 6px; overflow: auto; max-height: 250px; font-size: 0.85rem; }
+        .registry { margin-top: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .list-box { background: #fff; padding: 10px; border-radius: 8px; border: 1px solid #e2e8f0; min-height: 100px; }
+        .item-tag { display: inline-block; background: #e2e8f0; padding: 2px 8px; margin: 2px; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+        .item-tag:hover { background: #cbd5e1; }
+    </style>
+</head>
+<body>
+
+<div class="grid-layout">
+    <div class="card">
+        <h2>📦 Orders</h2>
+        <input id="o_user" placeholder="User ID">
+        <button onclick="call('POST', `/orders/create/${v('o_user')}`, 'order')">Create Order</button>
+        <hr>
+        <input id="o_id" placeholder="Order ID">
+        <input id="o_item" placeholder="Item ID">
+        <input id="o_qty" type="number" placeholder="Qty" value="1">
+        <button class="secondary" onclick="call('POST', `/orders/addItem/${v('o_id')}/${v('o_item')}/${v('o_qty')}`)">Add Item</button>
+        <button style="background:#16a34a" onclick="call('POST', `/orders/checkout/${v('o_id')}`)">Checkout</button>
+        <button class="secondary" onclick="call('GET', `/orders/find/${v('o_id')}`)">Find Details</button>
+    </div>
+
+    <div class="card">
+        <h2>🏗️ Stock</h2>
+        <input id="s_price" placeholder="Price">
+        <button onclick="call('POST', `/stock/item/create/${v('s_price')}`, 'item')">Create Item</button>
+        <hr>
+        <input id="s_id" placeholder="Item ID">
+        <input id="s_amt" type="number" placeholder="Amount">
+        <button class="secondary" onclick="call('POST', `/stock/add/${v('s_id')}/${v('s_amt')}`)">Add Stock</button>
+        <button class="secondary" onclick="call('GET', `/stock/find/${v('s_id')}`)">Query Stock</button>
+    </div>
+
+    <div class="card">
+        <h2>💳 Payment</h2>
+        <button onclick="call('POST', `/payment/create_user`, 'user')">Create User</button>
+        <hr>
+        <input id="p_user" placeholder="User ID">
+        <input id="p_amt" placeholder="Amount">
+        <button class="secondary" onclick="call('POST', `/payment/add_funds/${v('p_user')}/${v('p_amt')}`)">Add Funds</button>
+        <button class="secondary" onclick="call('GET', `/payment/find_user/${v('p_user')}`)">Get User Info</button>
+    </div>
+</div>
+
+<div class="card" style="margin-top:20px">
+    <h2>📡 Response from localhost:5000</h2>
+    <pre id="output">// No requests sent yet</pre>
+</div>
+
+<div class="registry">
+    <div class="list-box">
+        <h3>Users Found/Created</h3>
+        <div id="user-list"></div>
+    </div>
+    <div class="list-box">
+        <h3>Orders Found/Created</h3>
+        <div id="order-list"></div>
+    </div>
+</div>
+
+<script>
+    const BASE = 'http://localhost:8000';
+    const v = (id) => document.getElementById(id).value;
+    const cache = { users: new Set(), orders: new Set() };
+
+    async function call(method, path, type) {
+        const out = document.getElementById('output');
+        out.textContent = "Loading...";
+        try {
+            const res = await fetch(`${BASE}${path}`, { method });
+            const data = await res.json();
+            out.textContent = JSON.stringify(data, null, 2);
+
+            // Logic to track IDs for the UI registry
+            if (data.user_id) track('user', data.user_id);
+            if (data.order_id) track('order', data.order_id);
+            if (type === 'user' && data.user_id) track('user', data.user_id);
+            if (type === 'order' && data.order_id) track('order', data.order_id);
+        } catch (e) {
+            out.textContent = `Error: ${e.message}\nEnsure server is running on localhost:5000`;
+        }
+    }
+
+    function track(type, id) {
+        if (!id) return;
+        const set = type === 'user' ? cache.users : cache.orders;
+        const container = document.getElementById(`${type}-list`);
+        if (!set.has(id)) {
+            set.add(id);
+            const span = document.createElement('span');
+            span.className = 'item-tag';
+            span.textContent = id;
+            span.onclick = () => fill(type, id);
+            container.appendChild(span);
+        }
+    }
+
+    function fill(type, id) {
+        const targets = type === 'user' ? ['o_user', 'p_user'] : ['o_id', 'oi_order_id'];
+        targets.forEach(t => { if(document.getElementById(t)) document.getElementById(t).value = id; });
+    }
+</script>
+</body>
+</html>

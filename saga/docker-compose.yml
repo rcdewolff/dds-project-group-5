@@ -1,0 +1,307 @@
+services:
+  gateway:
+    image: nginx:1.25-bookworm
+    volumes:
+      - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:80"
+    depends_on:
+      - order-service
+      - stock-service
+      - payment-service
+
+  # ---------------------------------------------------------------------------
+  # Redis — shared signal bus for all saga pub/sub across services
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Order Service
+  # ---------------------------------------------------------------------------
+  order-service:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/routes', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    environment:
+      - GATEWAY_URL=http://gateway:80
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    command: gunicorn -b 0.0.0.0:5000 -w 10 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  order-consumer:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    command: python consumer.py
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  order-producer:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OUTBOX_POLL_INTERVAL=0.5
+    command: python producer.py
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+
+  order-citus-db:
+    image: citusdata/citus:13.0
+    command: postgres -c ssl=off
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=orders
+    ports:
+      - "5432:5432"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Stock Service
+  # ---------------------------------------------------------------------------
+  stock-service:
+    build: ./stock
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./stock:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: stock:latest
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/items', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
+    env_file:
+      - env/stock_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      stock-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  stock-producer:
+    build: ./stock
+    volumes:
+      - ./stock:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: stock:latest
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OUTBOX_POLL_INTERVAL=0.5
+    command: python producer.py
+    env_file:
+      - env/stock_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      stock-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+
+  stock-citus-db:
+    image: citusdata/citus:13.0
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=stocks
+    command: postgres -c ssl=off
+    ports:
+      - "5433:5432"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Payment Service
+  # ---------------------------------------------------------------------------
+  payment-service:
+    build: ./payment
+    volumes:
+      - ./payment:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: payment:latest
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/users', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    env_file:
+      - env/payment_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      payment-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  payment-producer:
+    build: ./payment
+    volumes:
+      - ./payment:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: payment:latest
+    command: python producer.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OUTBOX_POLL_INTERVAL=0.5
+    env_file:
+      - env/payment_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      payment-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+  payment-citus-db:
+    image: citusdata/citus:13.0
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=payments
+    command: postgres -c ssl=off
+    ports:
+      - "5434:5432"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Kafka
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:latest
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+volumes:
+  kafka_data:
