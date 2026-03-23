@@ -117,7 +117,7 @@ def handle_checkout(event: utils.BaseEvent):
 
 
 def init_db():
-    """Initialize event-store and projection tables"""
+    """Initialize payment persistence tables."""
     tmp_pool = init_db_pool()
     with tmp_pool.connection() as conn:
         with conn.cursor() as cur:
@@ -145,37 +145,13 @@ def get_user_from_db(user_id: str) -> UserValue | None:
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 repo = PaymentRepository(cur)
-                row = repo.get_user_snapshot(user_id)
-                if row is not None:                    
-                    return UserValue(credit=row['credit'])
-            
-                # No snapshot: replay events to reconstruct
-                event_rows = repo.get_events_for_user(user_id)
-                if not event_rows:
+                row = repo.get_account(user_id)
+                if row is None:
                     abort(400, f"User: {user_id} not found!")
-                
-            
-                credit = 0
-                for event in event_rows:
-                    
-                    event_type = event['event_type']
-                    payload = event['payload']
-                    
-                    if event_type == 'USER_CREATED':
-                        credit = payload.get('credit', 0)
-                        
-                    elif event_type == 'FUNDS_ADDED':
-                        credit += int(payload.get('amount', 0))
-                    
-                    elif event_type == 'FUNDS_DEBITED':
-                        credit -= int(payload.get('amount', 0))
-                return UserValue(credit=credit)
+                return UserValue(credit=row['credit'])
                 
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
-
-    return UserValue(credit=row['credit'])
-
 
 @app.post('/create_user')
 def create_user():
@@ -184,10 +160,7 @@ def create_user():
         with db_pool.connection() as conn:
             with conn.cursor() as cur:
                 repo = PaymentRepository(cur)
-                # Append creation event and create initial snapshot
-                version = 1
-                repo.insert_user_event(key, 'USER_CREATED', {"credit": 0}, version)
-                repo.insert_user_snapshot(key, 0, version)
+                repo.insert_account(key, 0)
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
@@ -203,9 +176,7 @@ def batch_init_users(n: int, starting_money: int):
                 repo = PaymentRepository(cur)
                 for i in range(n):
                     user_id = f"{i}"
-                    version = 1
-                    repo.insert_user_event(user_id, 'USER_CREATED', {"credit": starting_money}, version)
-                    repo.upsert_user_snapshot(user_id, starting_money, version)
+                    repo.upsert_account(user_id, starting_money, 1)
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"})
@@ -244,7 +215,7 @@ def remove_user_credit_direct(user_id: str, amount: int):
             with db_pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     repo = PaymentRepository(cur)
-                    row = repo.get_user_snapshot(user_id)
+                    row = repo.get_account(user_id)
                     if row is None:
                         return utils.Failure(f"User: {user_id} not found")
 
@@ -255,9 +226,8 @@ def remove_user_credit_direct(user_id: str, amount: int):
 
                     new_credit = current_credit - int(amount)
                     new_version = current_version + 1
-                    repo.insert_user_event(user_id, 'FUNDS_DEBITED', {"amount": int(amount)}, new_version)
 
-                    if repo.update_user_snapshot_versioned(user_id, new_credit, new_version, current_version):
+                    if repo.update_account_versioned(user_id, new_credit, new_version, current_version):
                         app.logger.info(f"User: {user_id} credit updated to: {new_credit}")
                         return utils.Success(new_credit)
 
@@ -280,7 +250,7 @@ def remove_user_credit(event: utils.BaseEvent) :
                 with conn.cursor(row_factory=dict_row) as cur:
                     repo = PaymentRepository(cur)
                     correlation_id = utils.event_correlation_id(event)
-                    row = repo.get_user_snapshot(event.payload.user_id)
+                    row = repo.get_account(event.payload.user_id)
                     if row is None:
                         # Write Outbox message for failed payment due to user not found
                         repo.insert_outbox_message(
@@ -330,9 +300,8 @@ def remove_user_credit(event: utils.BaseEvent) :
 
                     new_credit = current_credit - int(event.payload.amount)
                     new_version = current_version + 1
-                    repo.insert_user_event(event.payload.user_id, 'FUNDS_DEBITED', {"amount": int(event.payload.amount)}, new_version)
 
-                    if repo.update_user_snapshot_versioned(event.payload.user_id, new_credit, new_version, current_version):
+                    if repo.update_account_versioned(event.payload.user_id, new_credit, new_version, current_version):
                         app.logger.info(f"User: {event.payload.user_id} credit updated to: {new_credit}")
                         # Write to outbox
                         repo.insert_outbox_message(
@@ -398,16 +367,15 @@ def add_credit(user_id: str, amount: int):
             with db_pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     repo = PaymentRepository(cur)
-                    row = repo.get_user_snapshot(user_id)
+                    row = repo.get_account(user_id)
                     if row is None:
                         return abort(400, f"User: {user_id} not found!")
 
                     new_credit = int(row['credit']) + int(amount)
                     current_version = int(row['version'])
                     new_version = current_version + 1
-                    repo.insert_user_event(user_id, 'FUNDS_ADDED', {"amount": int(amount)}, new_version)
 
-                    if not repo.update_user_snapshot_versioned(user_id, new_credit, new_version, current_version):
+                    if not repo.update_account_versioned(user_id, new_credit, new_version, current_version):
                         conn.rollback()
                         app.logger.warning(f"Version conflict user {user_id}, retry {attempt + 1}/{MAX_RETRIES}")
                         continue
@@ -426,7 +394,7 @@ def get_users():
         with db_pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 repo = PaymentRepository(cur)
-                rows = repo.list_user_snapshots()
+                rows = repo.list_accounts()
                 return jsonify(rows)
     except psycopg.Error:
         return abort(400, DB_ERROR_STR)

@@ -77,17 +77,6 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sagas_order_status ON sagas(order_id, status)")
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS log (
-                    id TEXT PRIMARY KEY,
-                    order_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT now(),
-                    data TEXT NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS outbox (
                     id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL UNIQUE,

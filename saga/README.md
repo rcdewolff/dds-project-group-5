@@ -3,6 +3,19 @@
 Saga-critical communication is implemented with Kafka and database-backed Inbox/Outbox reliability.
 Redis is optional and not used in the saga-critical checkout progression path.
 
+## Persistence model
+
+The Saga implementation now uses conventional current-state relational tables as the source of truth:
+
+- Payment service stores user balances in `accounts`.
+- Stock service stores item stock/price in `inventory`.
+- Order service stores business state in `orders` and saga progression state in `sagas`.
+
+Inbox and Outbox tables are preserved in all services for idempotent consumption and reliable Kafka publication.
+
+Legacy `log`/`*_snapshots` tables are not used as primary domain state anymore and are no longer created by
+service startup logic.
+
 ### Project structure
 
 * `env`

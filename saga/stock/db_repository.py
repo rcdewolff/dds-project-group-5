@@ -20,23 +20,13 @@ class StockRepository:
     def create_tables(self) -> None:
         self.cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS log (
-                id TEXT PRIMARY KEY,
-                item_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload JSONB NOT NULL,
-                version INTEGER NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT now()
-            )
-            """
-        )
-        self.cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS item_snapshots (
+            CREATE TABLE IF NOT EXISTS inventory (
                 item_id TEXT PRIMARY KEY,
-                stock INTEGER NOT NULL,
-                price INTEGER NOT NULL,
-                version INTEGER NOT NULL
+                stock INTEGER NOT NULL CHECK (stock >= 0),
+                price INTEGER NOT NULL CHECK (price >= 0),
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
         )
@@ -94,18 +84,18 @@ class StockRepository:
         self.cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_outbox_event_id ON outbox(event_id)")
         self.cur.execute("CREATE INDEX IF NOT EXISTS idx_stock_outbox_status ON outbox(status, created_at)")
 
-    def get_item_snapshot(self, item_id: str) -> dict[str, Any] | None:
+    def get_inventory_item(self, item_id: str) -> dict[str, Any] | None:
         self.cur.execute(
-            "SELECT item_id, stock, price, version FROM item_snapshots WHERE item_id = %s",
+            "SELECT item_id, stock, price, version FROM inventory WHERE item_id = %s",
             (item_id,),
         )
         return self.cur.fetchone()
 
-    def list_item_snapshots(self) -> list[dict[str, Any]]:
-        self.cur.execute("SELECT item_id, stock, price FROM item_snapshots")
+    def list_inventory(self) -> list[dict[str, Any]]:
+        self.cur.execute("SELECT item_id, stock, price FROM inventory")
         return self.cur.fetchall()
 
-    def get_item_snapshots_for_ids(self, item_ids: list[str], include_price: bool = False) -> dict[str, dict[str, Any]]:
+    def get_inventory_items_for_ids(self, item_ids: list[str], include_price: bool = False) -> dict[str, dict[str, Any]]:
         if not item_ids:
             return {}
         placeholders = ",".join(["%s"] * len(item_ids))
@@ -113,37 +103,25 @@ class StockRepository:
         if include_price:
             cols = "item_id, stock, price, version"
         self.cur.execute(
-            f"SELECT {cols} FROM item_snapshots WHERE item_id IN ({placeholders})",
+            f"SELECT {cols} FROM inventory WHERE item_id IN ({placeholders})",
             item_ids,
         )
         return {row["item_id"]: row for row in self.cur.fetchall()}
 
-    def get_log_events_for_item(self, item_id: str) -> list[dict[str, Any]]:
+    def update_inventory_item_versioned(self, item_id: str, new_stock: int, new_version: int, current_version: int) -> bool:
         self.cur.execute(
-            "SELECT event_type, payload FROM log WHERE item_id = %s ORDER BY version",
-            (item_id,),
-        )
-        return self.cur.fetchall()
-
-    def insert_log_event(self, item_id: str, event_type: str, payload: dict[str, Any], version: int) -> None:
-        self.cur.execute(
-            "INSERT INTO log (id, item_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-            (str(uuid.uuid4()), item_id, event_type, self._to_jsonb(payload), version),
-        )
-
-    def update_snapshot_versioned(self, item_id: str, new_stock: int, new_version: int, current_version: int) -> bool:
-        print(f"Attempting to update snapshot for item {item_id} from version {current_version} to {new_version} with stock {new_stock}")
-        self.cur.execute(
-            """UPDATE item_snapshots
-               SET stock = %s, version = %s
+            """UPDATE inventory
+               SET stock = %s,
+                   version = %s,
+                   updated_at = now()
                WHERE item_id = %s AND version = %s""",
             (new_stock, new_version, item_id, current_version),
         )
         return self.cur.rowcount > 0
 
-    def insert_item_snapshot(self, item_id: str, stock: int, price: int, version: int) -> None:
+    def insert_inventory_item(self, item_id: str, stock: int, price: int, version: int = 1) -> None:
         self.cur.execute(
-            "INSERT INTO item_snapshots (item_id, stock, price, version) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO inventory (item_id, stock, price, version) VALUES (%s, %s, %s, %s)",
             (item_id, stock, price, version),
         )
 

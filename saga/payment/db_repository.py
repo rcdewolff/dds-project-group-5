@@ -19,22 +19,12 @@ class PaymentRepository:
     def create_tables(self) -> None:
         self.cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS log (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload JSONB NOT NULL,
-                version INTEGER NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT now()
-            )
-            """
-        )
-        self.cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_snapshots (
+            CREATE TABLE IF NOT EXISTS accounts (
                 user_id TEXT PRIMARY KEY,
-                credit INTEGER NOT NULL,
-                version INTEGER NOT NULL
+                credit INTEGER NOT NULL CHECK (credit >= 0),
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
         )
@@ -92,51 +82,42 @@ class PaymentRepository:
         self.cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_outbox_event_id ON outbox(event_id)")
         self.cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_outbox_status ON outbox(status, created_at)")
 
-    def get_user_snapshot(self, user_id: str) -> dict[str, Any] | None:
+    def get_account(self, user_id: str) -> dict[str, Any] | None:
         self.cur.execute(
-            "SELECT user_id, credit, version FROM user_snapshots WHERE user_id = %s",
+            "SELECT user_id, credit, version FROM accounts WHERE user_id = %s",
             (user_id,),
         )
         return self.cur.fetchone()
 
-    def list_user_snapshots(self) -> list[dict[str, Any]]:
-        self.cur.execute("SELECT user_id, credit FROM user_snapshots")
+    def list_accounts(self) -> list[dict[str, Any]]:
+        self.cur.execute("SELECT user_id, credit FROM accounts")
         return self.cur.fetchall()
 
-    def get_events_for_user(self, user_id: str) -> list[dict[str, Any]]:
+    def insert_account(self, user_id: str, credit: int, version: int = 1) -> None:
         self.cur.execute(
-            "SELECT event_type, payload FROM log WHERE user_id = %s ORDER BY id",
-            (user_id,),
-        )
-        return self.cur.fetchall()
-
-    def insert_user_event(self, user_id: str, event_type: str, payload: dict[str, Any], version: int) -> None:
-        self.cur.execute(
-            "INSERT INTO log (id, user_id, event_type, payload, version) VALUES (%s, %s, %s, %s, %s)",
-            (str(uuid.uuid4()), user_id, event_type, self._to_jsonb(payload), version),
-        )
-
-    def insert_user_snapshot(self, user_id: str, credit: int, version: int) -> None:
-        self.cur.execute(
-            "INSERT INTO user_snapshots (user_id, credit, version) VALUES (%s, %s, %s)",
+            "INSERT INTO accounts (user_id, credit, version) VALUES (%s, %s, %s)",
             (user_id, credit, version),
         )
 
-    def upsert_user_snapshot(self, user_id: str, credit: int, version: int) -> None:
+    def upsert_account(self, user_id: str, credit: int, version: int = 1) -> None:
         self.cur.execute(
             """
-            INSERT INTO user_snapshots (user_id, credit, version)
+            INSERT INTO accounts (user_id, credit, version)
             VALUES (%s, %s, %s)
             ON CONFLICT (user_id) DO UPDATE
-            SET credit = EXCLUDED.credit, version = EXCLUDED.version
+            SET credit = EXCLUDED.credit,
+                version = EXCLUDED.version,
+                updated_at = now()
             """,
             (user_id, credit, version),
         )
 
-    def update_user_snapshot_versioned(self, user_id: str, credit: int, new_version: int, current_version: int) -> bool:
+    def update_account_versioned(self, user_id: str, credit: int, new_version: int, current_version: int) -> bool:
         self.cur.execute(
-            """UPDATE user_snapshots
-               SET credit = %s, version = %s
+            """UPDATE accounts
+               SET credit = %s,
+                   version = %s,
+                   updated_at = now()
                WHERE user_id = %s AND version = %s""",
             (credit, new_version, user_id, current_version),
         )

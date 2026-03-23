@@ -142,10 +142,8 @@ class CheckoutSagaOrchestrator:
     ):
         """
         Atomically, in one transaction:
-          1. Append incoming_event to log — what triggered this (past-tense fact)
-          2. Append outgoing_command to log — what the saga decided (command)
-          3. Upsert the sagas snapshot
-          4. Write the outbox row (if a Kafka command needs to go out)
+                    1. Upsert the saga current state in `sagas`
+                    2. Write the outbox row (if a Kafka command needs to go out)
 
         The outbox relay (separate process) reads undelivered rows and
         sends them to Kafka, decoupling DB writes from Kafka availability.
@@ -155,35 +153,7 @@ class CheckoutSagaOrchestrator:
         try:
             with self.db_pool.connection() as conn:
                 with conn.cursor() as cur:
-                    # 1. Log the incoming trigger
-                    if incoming_event:
-                        cur.execute(
-                            """
-                            INSERT INTO log (id, order_id, event_type, data, created_at)
-                            VALUES (%s, %s, %s, %s, now())
-                            """,
-                            (
-                                str(uuid.uuid4()),
-                                context.order_id,
-                                incoming_event,
-                                std_json.dumps(incoming_payload) if incoming_payload else "{}",
-                            ),
-                        )
-                    # 2. Log the saga decision / outgoing command
-                    if outgoing_command:
-                        cur.execute(
-                            """
-                            INSERT INTO log (id, order_id, event_type, data, created_at)
-                            VALUES (%s, %s, %s, %s, now())
-                            """,
-                            (
-                                str(uuid.uuid4()),
-                                context.order_id,
-                                outgoing_command,
-                                std_json.dumps(outgoing_payload) if outgoing_payload else "{}",
-                            ),
-                        )
-                    # 3. Upsert saga snapshot
+                    # 1. Upsert saga current state
                     cur.execute(
                         """
                         INSERT INTO sagas (id, order_id, status, step, results)
@@ -201,7 +171,7 @@ class CheckoutSagaOrchestrator:
                             std_json.dumps({step.value: value for step, value in context.results.items()}),
                         ),
                     )
-                    # 4. Outbox — written atomically so the command is never lost
+                    # 2. Outbox — written atomically so the command is never lost
                     if outbox_topic and outbox_message:
                         payload_json = std_json.loads(outbox_message.decode())
                         cur.execute(
