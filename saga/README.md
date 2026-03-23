@@ -1,7 +1,7 @@
 # Distributed Data Systems Project Template
 
-Basic project structure with Python's Flask and Redis. 
-**You are free to use any web framework in any language and any database you like for this project.**
+Saga-critical communication is implemented with Kafka and database-backed Inbox/Outbox reliability.
+Redis is optional and not used in the saga-critical checkout progression path.
 
 ### Project structure
 
@@ -32,6 +32,11 @@ Basic project structure with Python's Flask and Redis.
 
 After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct
 (you can use the provided tests in the `\test` folder and change them as you wish). 
+
+The compose setup includes:
+- `kafka-init`: manually creates application topics (`stock.request`, `payment.request`, `order.request`) with 6 partitions and replication factor 1
+- dedicated `*-consumer` and `*-producer` containers for Kafka consumption and outbox publication
+- `order-checkout-worker` (Uvicorn/FastAPI) as the async HTTP worker for `/orders/checkout/*`
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 

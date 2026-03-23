@@ -121,7 +121,7 @@ def consume_messages(consumer):
                     repo = StockRepository(cur)
                     error_event = utils.build_generic_error_event(
                         order_id=str(uuid.uuid4()),
-                        saga_id=str(uuid.uuid4()),
+                        correlation_id=str(uuid.uuid4()),
                         error_message=f"Failed to decode message: {result.error}",
                     )
                     repo.insert_outbox_message('order.request', error_event)
@@ -130,8 +130,8 @@ def consume_messages(consumer):
         event = result.value
         print(f"Received message on topic {message.topic}: {event.event_type}.")
 
-        if isinstance(is_already_processed(event), utils.Success):
-            print(f"Event {event.saga_id} already processed, skipping.")
+        if isinstance(is_already_processed(event, message), utils.Success):
+            print(f"Event {utils.event_correlation_id(event)} already processed, skipping.")
             handle_already_processed(event)
             continue
             
@@ -139,15 +139,24 @@ def consume_messages(consumer):
         dispatch_event(event)
             
         
-def is_already_processed(event: utils.BaseEvent):
+def is_already_processed(event: utils.BaseEvent, message):
     with db_pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             repo = StockRepository(cur)
-            if repo.received_event_exists(event.id):
+            if repo.inbox_event_exists(event.id):
                 return utils.Success(0)  # Already processed, skip
             
             # Mark event as received for idempotency
-            repo.insert_received_event(event.id)
+            raw_payload = message.value.decode() if isinstance(message.value, bytes) else str(message.value)
+            repo.insert_inbox_event(
+                event_id=event.id,
+                topic=message.topic,
+                partition=message.partition,
+                kafka_offset=message.offset,
+                correlation_id=utils.event_correlation_id(event),
+                payload=event,
+                payload_hash=utils.payload_hash(raw_payload),
+            )
 
 
 def dispatch_event(event: utils.BaseEvent, already_processed=False):
@@ -171,29 +180,29 @@ def handle_already_processed(event: utils.BaseEvent):
     with db_pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             repo = StockRepository(cur)
-            result = repo.get_received_event_result(event.id)
+            result = repo.get_inbox_event_result(event.id)
 
             # FIXME This should not happen, but we log it just in case to investigate potential issues with the idempotency mechanism
             if result is None:
-                app.logger.error(f"Event {event.saga_id} marked as processed but no result found in DB")
+                app.logger.error(f"Event {utils.event_correlation_id(event)} marked as processed but no result found in DB")
                 return
 
             if event.event_type == utils.Commands.RESERVE_STOCK:
                 if result.get('status') == 'success':
                     response_event = utils.build_stock_allocated_event(
-                        saga_id=event.saga_id,
+                        correlation_id=utils.event_correlation_id(event),
                         order_id=event.payload.order_id,
                         amount=result.get('amount', 0),
                     )
                 else:
                     response_event = utils.build_stock_unavailable_event(
-                        saga_id=event.saga_id,
+                        correlation_id=utils.event_correlation_id(event),
                         order_id=event.payload.order_id,
                     )
 
                 # write to outbox
                 repo.insert_outbox_message('order.request', response_event)
-                app.logger.info(f"Resent response for already processed event {event.saga_id}: {response_event.event_type}")
+                app.logger.info(f"Resent response for already processed event {utils.event_correlation_id(event)}: {response_event.event_type}")
             
 
 def handle_stock_reservation(event: utils.BaseEvent):
@@ -201,7 +210,7 @@ def handle_stock_reservation(event: utils.BaseEvent):
     payload = event.payload
     print(f"Handling stock reservation for order: {payload.order_id} with items: {payload.items}")
 
-    result = subtract_stock_batch(payload.order_id, payload.items, event.id, event.saga_id)
+    result = subtract_stock_batch(payload.order_id, payload.items, event.id, utils.event_correlation_id(event))
     
     if isinstance(result, utils.Success):
         app.logger.info(f"Stock reservation successful for order {payload.order_id}, total cost: {result.value}")
@@ -257,7 +266,7 @@ def handle_rollback(event: utils.BaseEvent):
 
                     print(f"Stock rollback completed for order: {order_id}")
                     rollback_event = utils.build_stock_freed_event(
-                        saga_id=event.saga_id,
+                        correlation_id=utils.event_correlation_id(event),
                         order_id=order_id,
                     )
 
@@ -274,7 +283,7 @@ def handle_rollback(event: utils.BaseEvent):
 
 
 
-def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: str, saga_id: str):
+def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: str, correlation_id: str):
     if not items:
         return utils.Failure("No items to reserve")
 
@@ -305,7 +314,7 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: 
                         repo.insert_outbox_message(
                             'order.request',
                             utils.build_stock_unavailable_event(
-                                saga_id=saga_id,
+                                correlation_id=correlation_id,
                                 order_id=order_id,
                             ),
                         )
@@ -335,8 +344,8 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: 
                         total_cost += price * int(qty)
 
                     if not conflict:
-                        # Log the successful reservation in the received_events table for idempotency
-                        repo.set_received_event_result(
+                        # Store deterministic result in inbox for idempotent replay.
+                        repo.set_inbox_event_result(
                             event_id=event_id,
                             status='PROCESSED',
                             result={"status": "success", "amount": total_cost},
@@ -346,7 +355,7 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: 
                         repo.insert_outbox_message(
                             'order.request',
                             utils.build_stock_allocated_event(
-                                saga_id=saga_id,
+                                correlation_id=correlation_id,
                                 order_id=order_id,
                                 amount=total_cost,
                             ),
@@ -360,8 +369,7 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: 
                     
                     # TODO Add option for transient failure (RETRYABLE_FAILURE in case of max retry reached)
                     if attempt == MAX_RETRIES - 1:
-                        # Log the failure in the received_events table for idempotency
-                        repo.set_received_event_result(
+                        repo.set_inbox_event_result(
                             event_id=event_id,
                             status='PROCESSED',
                             result={"status": "failure", "reason": "version conflict"},
@@ -370,7 +378,7 @@ def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: 
                         repo.insert_outbox_message(
                             'order.request',
                             utils.build_stock_unavailable_event(
-                                saga_id=event_id,
+                                correlation_id=correlation_id,
                                 order_id=order_id,
                             ),
                         )

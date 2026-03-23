@@ -6,6 +6,7 @@ services:
     ports:
       - "8000:80"
     depends_on:
+      - order-checkout-worker
       - order-service
       - stock-service
       - payment-service
@@ -47,8 +48,6 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - PYTHONUNBUFFERED=1
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
     command: gunicorn -b 0.0.0.0:5000 -w 10 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     env_file:
       - env/order_citus.env
@@ -58,8 +57,29 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-      redis:
+      kafka-init:
+        condition: service_completed_successfully
+
+  order-checkout-worker:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    command: uvicorn checkout_worker:app --host 0.0.0.0 --port 8001 --workers 1
+    environment:
+      - ORDER_SERVICE_URL=http://order-service:5000
+      - CHECKOUT_TIMEOUT_SECONDS=35
+      - CHECKOUT_POLL_INTERVAL=0.25
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-service:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   order-consumer:
     build: ./order
@@ -69,8 +89,6 @@ services:
     image: order:latest
     environment:
       - PYTHONUNBUFFERED=1
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
     command: python consumer.py
     env_file:
       - env/order_citus.env
@@ -80,8 +98,8 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   order-producer:
     build: ./order
@@ -103,6 +121,8 @@ services:
         condition: service_healthy
       order-service:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   order-citus-db:
     image: citusdata/citus:13.0
@@ -130,8 +150,6 @@ services:
     build: ./stock
     environment:
       - PYTHONUNBUFFERED=1
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
     volumes:
       - ./stock:/home/flask-app/
       - ./services:/home/flask-app/services
@@ -157,8 +175,28 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-      redis:
+      kafka-init:
+        condition: service_completed_successfully
+
+  stock-consumer:
+    build: ./stock
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./stock:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: stock:latest
+    command: python consumer.py
+    env_file:
+      - env/stock_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      stock-citus-db:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   stock-producer:
     build: ./stock
@@ -180,6 +218,8 @@ services:
         condition: service_healthy
       stock-service:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   stock-citus-db:
     image: citusdata/citus:13.0
@@ -224,8 +264,6 @@ services:
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     environment:
       - PYTHONUNBUFFERED=1
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
     env_file:
       - env/payment_citus.env
       - env/kafka_settings.env
@@ -234,8 +272,28 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-      redis:
+      kafka-init:
+        condition: service_completed_successfully
+
+  payment-consumer:
+    build: ./payment
+    volumes:
+      - ./payment:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: payment:latest
+    command: python consumer.py
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - env/payment_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      payment-citus-db:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   payment-producer:
     build: ./payment
@@ -257,6 +315,8 @@ services:
         condition: service_healthy
       payment-service:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
   payment-citus-db:
     image: citusdata/citus:13.0
     environment:
@@ -300,8 +360,22 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     volumes:
       - kafka_data:/var/lib/kafka/data
+
+  kafka-init:
+    image: apache/kafka:latest
+    command: ["/bin/sh", "/scripts/create-kafka-topics.sh"]
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_APP_TOPIC_PARTITIONS=6
+      - KAFKA_APP_TOPIC_REPLICATION_FACTOR=1
+    depends_on:
+      kafka:
+        condition: service_healthy
 
 volumes:
   kafka_data:

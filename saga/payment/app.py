@@ -58,8 +58,38 @@ def consume_messages(consumer):
             continue
             
         event = result.value
+        correlation_id = utils.event_correlation_id(event)
+
+        with db_pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                repo = PaymentRepository(cur)
+                if repo.inbox_event_exists(event.id):
+                    app.logger.info("Payment inbox dedupe hit event_id=%s correlation_id=%s", event.id, correlation_id)
+                    conn.commit()
+                    continue
+
+                raw_payload = message.value.decode() if isinstance(message.value, bytes) else str(message.value)
+                repo.insert_inbox_event(
+                    event_id=event.id,
+                    topic=message.topic,
+                    partition=message.partition,
+                    kafka_offset=message.offset,
+                    correlation_id=correlation_id,
+                    payload=event,
+                    payload_hash=utils.payload_hash(raw_payload),
+                )
+
         print(f"Received message on topic {message.topic}: {event.event_type}.") 
         handle_checkout(event)
+
+        with db_pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                repo = PaymentRepository(cur)
+                repo.set_inbox_event_result(
+                    event_id=event.id,
+                    status="PROCESSED",
+                    result={"status": "processed", "event_type": event.event_type},
+                )
 
 
 def dispatch_event(event: utils.BaseEvent):
@@ -249,6 +279,7 @@ def remove_user_credit(event: utils.BaseEvent) :
             with db_pool.connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     repo = PaymentRepository(cur)
+                    correlation_id = utils.event_correlation_id(event)
                     row = repo.get_user_snapshot(event.payload.user_id)
                     if row is None:
                         # Write Outbox message for failed payment due to user not found
@@ -264,8 +295,11 @@ def remove_user_credit(event: utils.BaseEvent) :
                                     reason="User not found"
                                 ),
                                 order_id=event.payload.order_id,
-                                saga_id = event.saga_id
-                            )
+                                correlation_id=correlation_id,
+                                saga_id=correlation_id,
+                            ),
+                            message_key=correlation_id,
+                            correlation_id=correlation_id,
                         )
                         return utils.Failure(f"User: {event.payload.user_id} not found")
 
@@ -286,8 +320,11 @@ def remove_user_credit(event: utils.BaseEvent) :
                                     reason="Insufficient credit"
                                 ),
                                 order_id=event.payload.order_id,
-                                saga_id = event.saga_id
-                            )
+                                correlation_id=correlation_id,
+                                saga_id=correlation_id,
+                            ),
+                            message_key=correlation_id,
+                            correlation_id=correlation_id,
                         )
                         return utils.Failure("Insufficient credit")
 
@@ -310,8 +347,11 @@ def remove_user_credit(event: utils.BaseEvent) :
                                     remaining_credit=new_credit
                                 ),
                                 order_id=event.payload.order_id,
-                                saga_id = event.saga_id
-                            )
+                                correlation_id=correlation_id,
+                                saga_id=correlation_id,
+                            ),
+                            message_key=correlation_id,
+                            correlation_id=correlation_id,
                         )  
                         return utils.Success(new_credit)
                         
@@ -335,8 +375,11 @@ def remove_user_credit(event: utils.BaseEvent) :
                                     reason="Version conflict, please retry"
                                 ),
                                 order_id=event.payload.order_id,
-                                saga_id = event.saga_id
-                            )
+                                correlation_id=correlation_id,
+                                saga_id=correlation_id,
+                            ),
+                            message_key=correlation_id,
+                            correlation_id=correlation_id,
                         )
                         
 

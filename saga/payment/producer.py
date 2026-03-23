@@ -95,9 +95,9 @@ class OutboxRelay:
 				with conn.cursor(row_factory=dict_row) as cur:
 					cur.execute(
 						"""
-						SELECT id, topic, payload
+						SELECT id, topic, payload, message_key, event_id, correlation_id, publish_attempts
 						FROM outbox
-						WHERE sent = FALSE
+						WHERE status = 'PENDING'
 						ORDER BY created_at ASC
 						LIMIT %s
 						FOR UPDATE SKIP LOCKED
@@ -112,26 +112,46 @@ class OutboxRelay:
 					for row in rows:
 						try:
 							event = _payload_to_base_event(row["payload"])
-							future = self.kafka_producer.send(topic=row["topic"], value=event)
+							message_key = str(row["message_key"]).encode("utf-8")
+							future = self.kafka_producer.send(topic=row["topic"], key=message_key, value=event)
 							# Ensure broker ack before marking as sent to avoid message loss.
 							future.get(timeout=10)
 
 							cur.execute(
 								"""
 								UPDATE outbox
-								SET sent = TRUE
+								SET status = 'PUBLISHED',
+								    publish_attempts = publish_attempts + 1,
+								    published_at = now(),
+								    last_error = NULL
 								WHERE id = %s
 								""",
 								(row["id"],),
 							)
 							relayed_count += 1
-							logger.info("Outbox relayed message %s to topic %s", row["id"], row["topic"])
+							logger.info(
+								"Outbox relayed id=%s event_id=%s correlation_id=%s topic=%s",
+								row["id"],
+								row["event_id"],
+								row["correlation_id"],
+								row["topic"],
+							)
 						except Exception as row_exc:
+							cur.execute(
+								"""
+								UPDATE outbox
+								SET publish_attempts = publish_attempts + 1,
+								    last_error = %s
+								WHERE id = %s
+								""",
+								(str(row_exc), row["id"]),
+							)
 							# Leave failed rows unsent so they can be retried later.
 							logger.exception(
-								"Outbox relay failed for row %s on topic %s: %s",
+								"Outbox relay failed for row %s on topic %s correlation_id=%s: %s",
 								row.get("id"),
 								row.get("topic"),
+								row.get("correlation_id"),
 								row_exc,
 							)
 
@@ -153,11 +173,13 @@ def _payload_to_base_event(payload: Any) -> utils.BaseEvent:
 		return json.decode(payload.encode(), type=utils.BaseEvent[dict])
 
 	if isinstance(payload, dict):
+		correlation_id = payload.get("correlation_id") or payload.get("saga_id")
 		return utils.BaseEvent(
 			id=payload["id"],
 			event_type=payload["event_type"],
 			order_id=payload["order_id"],
-			saga_id=payload["saga_id"],
+			correlation_id=correlation_id,
+			saga_id=payload.get("saga_id", correlation_id),
 			payload=payload["payload"],
 			timestamp=payload.get("timestamp", time.time()),
 		)
