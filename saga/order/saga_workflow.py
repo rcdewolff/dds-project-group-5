@@ -1,4 +1,5 @@
 import json as std_json
+import time
 import uuid
 from typing import Any
 
@@ -9,6 +10,7 @@ from services import utils
 
 FINAL_STATUSES = {"completed", "failed", "compensated"}
 ACTIVE_STATUSES = {"pending", "running", "compensating"}
+CHECKOUT_RESULTS_TOPIC = "checkout-results"
 
 
 def _load_results(row: dict[str, Any]) -> dict[str, Any]:
@@ -48,6 +50,60 @@ def _insert_outbox_event(cur, topic: str, event: utils.BaseEvent[Any]) -> None:
             topic,
             utils.event_correlation_id(event),
             utils.event_correlation_id(event),
+            payload_text,
+        ),
+    )
+
+
+def _emit_checkout_terminal_result_once(
+    cur,
+    *,
+    correlation_id: str,
+    order_id: str,
+    status: str,
+    results: dict[str, Any],
+    error: str | None = None,
+) -> None:
+    event_payload = {
+        "event_type": "checkout.result",
+        "correlation_id": correlation_id,
+        "order_id": order_id,
+        "status": status,
+        "results": results,
+        "error": error,
+        "timestamp": time.time(),
+    }
+    event = utils.BaseEvent.create(
+        event_type="checkout.result",
+        payload=event_payload,
+        order_id=order_id,
+        correlation_id=correlation_id,
+        id=f"checkout-result:{correlation_id}",
+    )
+    payload_text = json.encode(event).decode()
+
+    cur.execute(
+        """
+        INSERT INTO outbox (
+            id,
+            event_id,
+            topic,
+            message_key,
+            correlation_id,
+            payload,
+            status,
+            publish_attempts,
+            created_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'PENDING', 0, now())
+        ON CONFLICT (event_id) DO NOTHING
+        """,
+        (
+            str(uuid.uuid4()),
+            event.id,
+            CHECKOUT_RESULTS_TOPIC,
+            correlation_id,
+            correlation_id,
             payload_text,
         ),
     )
@@ -171,6 +227,14 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
             step=saga["step"],
             results=results,
         )
+        _emit_checkout_terminal_result_once(
+            cur,
+            correlation_id=correlation_id,
+            order_id=saga["order_id"],
+            status="failed",
+            results=results,
+            error="stock_unavailable",
+        )
         return {"handled": True, "status": "failed"}
 
     if event.event_type == utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED:
@@ -186,6 +250,13 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
             order_id=saga["order_id"],
             status="completed",
             step=saga["step"],
+            results=results,
+        )
+        _emit_checkout_terminal_result_once(
+            cur,
+            correlation_id=correlation_id,
+            order_id=saga["order_id"],
+            status="completed",
             results=results,
         )
         return {"handled": True, "status": "completed"}
@@ -226,6 +297,14 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
             status="compensated",
             step=saga["step"],
             results=results,
+        )
+        _emit_checkout_terminal_result_once(
+            cur,
+            correlation_id=correlation_id,
+            order_id=saga["order_id"],
+            status="compensated",
+            results=results,
+            error=results.get("payment", {}).get("reason", "payment_failed"),
         )
         return {"handled": True, "status": "compensated"}
 

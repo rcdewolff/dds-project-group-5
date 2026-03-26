@@ -70,7 +70,9 @@ services:
     environment:
       - ORDER_SERVICE_URL=http://order-service:5000
       - CHECKOUT_TIMEOUT_SECONDS=35
-      - CHECKOUT_POLL_INTERVAL=0.25
+      - CHECKOUT_MAX_INFLIGHT=200
+      - CHECKOUT_RESULTS_TOPIC=checkout-results
+      - CHECKOUT_WORKER_GROUP_ID=checkout-worker
       - PYTHONUNBUFFERED=1
     env_file:
       - env/order_citus.env
