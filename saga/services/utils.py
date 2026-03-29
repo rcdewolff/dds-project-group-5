@@ -328,8 +328,9 @@ def build_generic_error_event(order_id: str, correlation_id: str, error_message:
         payload={"error": error_message},
     )
 
-def build_reserve_stock_command(correlation_id: str, order_id: str, items: list[tuple[str, int]]) -> tuple[str, bytes]:
-    event = BaseEvent(
+
+def reserve_stock_command_event(correlation_id: str, order_id: str, items: list[tuple[str, int]]) -> BaseEvent[ReserveStockCommandPayload]:
+    return BaseEvent(
         id=str(uuid.uuid4()),
         event_type=Commands.RESERVE_STOCK,
         order_id=order_id,
@@ -337,10 +338,15 @@ def build_reserve_stock_command(correlation_id: str, order_id: str, items: list[
         saga_id=correlation_id,
         payload=ReserveStockCommandPayload(order_id=order_id, items=items),
     )
+
+
+def build_reserve_stock_command(correlation_id: str, order_id: str, items: list[tuple[str, int]]) -> tuple[str, bytes]:
+    event = reserve_stock_command_event(correlation_id=correlation_id, order_id=order_id, items=items)
     return "stock.request", json.encode(event)
 
-def build_start_payment_command(correlation_id: str, order_id: str, user_id: str, amount: int) -> tuple[str, bytes]:
-    event = BaseEvent(
+
+def start_payment_command_event(correlation_id: str, order_id: str, user_id: str, amount: int) -> BaseEvent[StartPaymentCommandPayload]:
+    return BaseEvent(
         id=str(uuid.uuid4()),
         event_type=Commands.START_PAYMENT,
         order_id=order_id,
@@ -348,10 +354,20 @@ def build_start_payment_command(correlation_id: str, order_id: str, user_id: str
         saga_id=correlation_id,
         payload=StartPaymentCommandPayload(order_id=order_id, user_id=user_id, amount=amount),
     )
+
+
+def build_start_payment_command(correlation_id: str, order_id: str, user_id: str, amount: int) -> tuple[str, bytes]:
+    event = start_payment_command_event(
+        correlation_id=correlation_id,
+        order_id=order_id,
+        user_id=user_id,
+        amount=amount,
+    )
     return "payment.request", json.encode(event)
 
-def build_free_stock_command(correlation_id: str, order_id: str, items: list[tuple[str, int]]) -> tuple[str, bytes]:
-    event = BaseEvent(
+
+def free_stock_command_event(correlation_id: str, order_id: str, items: list[tuple[str, int]]) -> BaseEvent[FreeStockCommandPayload]:
+    return BaseEvent(
         id=str(uuid.uuid4()),
         event_type=Commands.FREE_STOCK,
         order_id=order_id,
@@ -359,6 +375,10 @@ def build_free_stock_command(correlation_id: str, order_id: str, items: list[tup
         saga_id=correlation_id,
         payload=FreeStockCommandPayload(order_id=order_id, items=items),
     )
+
+
+def build_free_stock_command(correlation_id: str, order_id: str, items: list[tuple[str, int]]) -> tuple[str, bytes]:
+    event = free_stock_command_event(correlation_id=correlation_id, order_id=order_id, items=items)
     return "stock.request", json.encode(event)
 
 

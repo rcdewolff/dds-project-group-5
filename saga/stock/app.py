@@ -91,276 +91,149 @@ def get_item_from_db(item_id: str) -> StockValue | None:
 
 
 def consume_messages(consumer):
-    """Background task to process Kafka messages."""
-    print("Kafka consumer started...")
+    """Process Kafka messages with one DB transaction per event."""
+    app.logger.info("Stock consumer started")
     for message in consumer:
         result = utils.decode_and_type_event(message)
         if isinstance(result, utils.Failure):
-            print(f"Failed to decode message: {result.error}")
-            # Write to outbox
-            with db_pool.connection() as conn:
-                with conn.cursor() as cur:
-                    repo = StockRepository(cur)
-                    error_event = utils.build_generic_error_event(
-                        order_id=str(uuid.uuid4()),
-                        correlation_id=str(uuid.uuid4()),
-                        error_message=f"Failed to decode message: {result.error}",
-                    )
-                    repo.insert_outbox_message('order.request', error_event)
+            app.logger.error("Stock decode failed: %s", result.error)
             continue
-            
+
         event = result.value
-        print(f"Received message on topic {message.topic}: {event.event_type}.")
+        correlation_id = utils.event_correlation_id(event)
+        with db_pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                repo = StockRepository(cur)
+                if repo.inbox_event_exists(event.id):
+                    inbox_result = repo.get_inbox_event_result(event.id) or {
+                        "status": "failure",
+                        "reason": "duplicate_event",
+                    }
+                    _emit_stock_result(repo, event, correlation_id, inbox_result)
+                    conn.commit()
+                    continue
 
-        if isinstance(is_already_processed(event, message), utils.Success):
-            print(f"Event {utils.event_correlation_id(event)} already processed, skipping.")
-            handle_already_processed(event)
-            continue
-            
+                raw_payload = message.value.decode() if isinstance(message.value, bytes) else str(message.value)
+                repo.insert_inbox_event(
+                    event_id=event.id,
+                    topic=message.topic,
+                    partition=message.partition,
+                    kafka_offset=message.offset,
+                    correlation_id=correlation_id,
+                    payload=event,
+                    payload_hash=utils.payload_hash(raw_payload),
+                )
 
-        dispatch_event(event)
-            
-        
-def is_already_processed(event: utils.BaseEvent, message):
-    with db_pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            repo = StockRepository(cur)
-            if repo.inbox_event_exists(event.id):
-                return utils.Success(0)  # Already processed, skip
-            
-            # Mark event as received for idempotency
-            raw_payload = message.value.decode() if isinstance(message.value, bytes) else str(message.value)
-            repo.insert_inbox_event(
-                event_id=event.id,
-                topic=message.topic,
-                partition=message.partition,
-                kafka_offset=message.offset,
-                correlation_id=utils.event_correlation_id(event),
-                payload=event,
-                payload_hash=utils.payload_hash(raw_payload),
-            )
-
-
-def dispatch_event(event: utils.BaseEvent, already_processed=False):
-
-    if already_processed:
-        handle_already_processed(event)
-        return
-
-    if event.event_type == utils.Commands.RESERVE_STOCK:
-        handle_stock_reservation(event)
-    elif event.event_type == utils.Commands.FREE_STOCK:
-        handle_rollback(event)
-
-
-
-def handle_already_processed(event: utils.BaseEvent):
-    """
-    Handle events that have already been processed.
-    """
-    # Extract the result from the received_events table and resend the appropriate response based on the event type
-    with db_pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            repo = StockRepository(cur)
-            result = repo.get_inbox_event_result(event.id)
-
-            # FIXME This should not happen, but we log it just in case to investigate potential issues with the idempotency mechanism
-            if result is None:
-                app.logger.error(f"Event {utils.event_correlation_id(event)} marked as processed but no result found in DB")
-                return
-
-            if event.event_type == utils.Commands.RESERVE_STOCK:
-                if result.get('status') == 'success':
-                    response_event = utils.build_stock_allocated_event(
-                        correlation_id=utils.event_correlation_id(event),
-                        order_id=event.payload.order_id,
-                        amount=result.get('amount', 0),
-                    )
+                if event.event_type == utils.Commands.RESERVE_STOCK:
+                    checkout_result = _reserve_stock(repo, event)
+                elif event.event_type == utils.Commands.FREE_STOCK:
+                    checkout_result = _free_stock(repo, event)
                 else:
-                    response_event = utils.build_stock_unavailable_event(
-                        correlation_id=utils.event_correlation_id(event),
-                        order_id=event.payload.order_id,
-                    )
+                    checkout_result = {"status": "failure", "reason": "unsupported_event_type"}
 
-                # write to outbox
-                repo.insert_outbox_message('order.request', response_event)
-                app.logger.info(f"Resent response for already processed event {utils.event_correlation_id(event)}: {response_event.event_type}")
-            
+                repo.set_inbox_event_result(
+                    event_id=event.id,
+                    status="PROCESSED",
+                    result=checkout_result,
+                    error=checkout_result.get("reason") if checkout_result.get("status") == "failure" else None,
+                )
+                _emit_stock_result(repo, event, correlation_id, checkout_result)
+                conn.commit()
 
-def handle_stock_reservation(event: utils.BaseEvent):
-   
-    payload = event.payload
-    print(f"Handling stock reservation for order: {payload.order_id} with items: {payload.items}")
 
-    result = subtract_stock_batch(payload.order_id, payload.items, event.id, utils.event_correlation_id(event))
-    
-    if isinstance(result, utils.Success):
-        app.logger.info(f"Stock reservation successful for order {payload.order_id}, total cost: {result.value}")
-    else:
-        app.logger.info(f"Stock reservation failed for order {payload.order_id}, reason: {result.error}")
-    
+def _reserve_stock(repo: StockRepository, event: utils.BaseEvent) -> dict[str, int | str]:
+    items = sorted(event.payload.items, key=lambda x: x[0])
+    if not items:
+        return {"status": "failure", "reason": "no_items"}
 
-def handle_rollback(event: utils.BaseEvent):
+    max_retries = 3
+    for _ in range(max_retries):
+        item_ids = [item_id for item_id, _ in items]
+        rows = repo.get_inventory_items_for_ids(item_ids, include_price=True)
 
-    order_id = event.payload.order_id
+        missing = [item_id for item_id, _ in items if item_id not in rows]
+        if missing:
+            return {"status": "failure", "reason": "items_not_found"}
+
+        unavailable = [item_id for item_id, qty in items if int(rows[item_id]["stock"]) < int(qty)]
+        if unavailable:
+            return {"status": "failure", "reason": "insufficient_stock"}
+
+        total_cost = 0
+        conflict = False
+        for item_id, qty in items:
+            row = rows[item_id]
+            current_version = int(row["version"])
+            new_stock = int(row["stock"]) - int(qty)
+            new_version = current_version + 1
+            if not repo.update_inventory_item_versioned(item_id, new_stock, new_version, current_version):
+                conflict = True
+                break
+            total_cost += int(row["price"]) * int(qty)
+
+        if not conflict:
+            return {"status": "success", "amount": total_cost}
+
+    return {"status": "failure", "reason": "version_conflict"}
+
+
+def _free_stock(repo: StockRepository, event: utils.BaseEvent) -> dict[str, str]:
     qty_by_item: dict[str, int] = defaultdict(int)
     for item_id, qty in event.payload.items:
         qty_by_item[item_id] += int(qty)
-
     items = sorted(qty_by_item.items(), key=lambda x: x[0])
-    print(f"Handling stock rollback for order: {order_id}")
-    MAX_RETRIES = 3
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            with db_pool.connection() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    repo = StockRepository(cur)
-                    item_ids = [item_id for item_id, _ in items]
-                    rows = repo.get_inventory_items_for_ids(item_ids)
+    max_retries = 3
+    for _ in range(max_retries):
+        item_ids = [item_id for item_id, _ in items]
+        rows = repo.get_inventory_items_for_ids(item_ids)
 
-                    conflict = False
-                    for item_id, qty in items:
-                        if item_id not in rows:
-                            app.logger.warning(f"Rollback requested for unknown item {item_id} in order {order_id}")
-                            continue
-                        row = rows[item_id]
-                        current_version = int(row['version'])
-                        new_stock = int(row['stock']) + int(qty)
-                        new_version = current_version + 1
-                        app.logger.info(f"Rolling back stock for item {item_id}: adding back {qty} to stock {row['stock']} => new stock = {new_stock} (version {current_version})")
+        conflict = False
+        for item_id, qty in items:
+            row = rows.get(item_id)
+            if row is None:
+                continue
+            current_version = int(row["version"])
+            new_stock = int(row["stock"]) + int(qty)
+            new_version = current_version + 1
+            if not repo.update_inventory_item_versioned(item_id, new_stock, new_version, current_version):
+                conflict = True
+                break
 
-                        if not repo.update_inventory_item_versioned(item_id, new_stock, new_version, current_version):
-                            conflict = True
-                            app.logger.info(f"Version conflict during stock rollback for item {item_id} in order {order_id}")
-                            break
+        if not conflict:
+            return {"status": "success"}
 
-                    if conflict:
-                        conn.rollback()
-                        app.logger.warning(f"Version conflict in rollback for order {order_id}, retry {attempt + 1}/{MAX_RETRIES}")
-                        continue
-
-                    print(f"Stock rollback completed for order: {order_id}")
-                    rollback_event = utils.build_stock_freed_event(
-                        correlation_id=utils.event_correlation_id(event),
-                        order_id=order_id,
-                    )
-
-                    # Write to the outbox
-                    repo.insert_outbox_message('order.request', rollback_event)
-                    return
-
-        except psycopg.Error as e:
-            app.logger.error(f"Stock rollback DB error: {e}")
-            return
-
-    app.logger.error(f"Stock rollback failed after {MAX_RETRIES} retries for order: {order_id}")
+    return {"status": "failure", "reason": "version_conflict"}
 
 
+def _emit_stock_result(
+    repo: StockRepository,
+    event: utils.BaseEvent,
+    correlation_id: str,
+    result: dict[str, int | str],
+) -> None:
+    if event.event_type == utils.Commands.RESERVE_STOCK:
+        if result.get("status") == "success":
+            response_event = utils.build_stock_allocated_event(
+                correlation_id=correlation_id,
+                order_id=event.payload.order_id,
+                amount=int(result.get("amount", 0)),
+            )
+        else:
+            response_event = utils.build_stock_unavailable_event(
+                correlation_id=correlation_id,
+                order_id=event.payload.order_id,
+            )
+        response_event.id = f"stock-result:{event.id}"
+        repo.insert_outbox_message("order.request", response_event)
 
-
-def subtract_stock_batch(order_id: str, items: list[tuple[str, int]], event_id: str, correlation_id: str):
-    if not items:
-        return utils.Failure("No items to reserve")
-
-    items = sorted(items, key=lambda x: x[0])  # ← add this
-    MAX_RETRIES = 3
-    for attempt in range(MAX_RETRIES):
-        try:
-            with db_pool.connection() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    repo = StockRepository(cur)
-                    # Read all items WITHOUT lock
-                    item_ids = [item_id for item_id, _ in items]
-                    rows = repo.get_inventory_items_for_ids(item_ids, include_price=True)
-
-                    # Check that all items exist
-                    missing = [iid for iid, _ in items if iid not in rows]
-                    if missing:
-                        
-                        return utils.Failure(f"Items not found: {missing}")
-
-                    # Check availability before writing anything
-                    unavailable = [
-                        iid for iid, qty in items
-                        if int(rows[iid]['stock']) < int(qty)
-                    ]
-                    if unavailable:
-                        # write to outbox
-                        repo.insert_outbox_message(
-                            'order.request',
-                            utils.build_stock_unavailable_event(
-                                correlation_id=correlation_id,
-                                order_id=order_id,
-                            ),
-                        )
-                        return utils.Failure(f"Insufficient stock for items: {unavailable}")
-
-                    # Write phase: version-guarded update for every item
-                    conflict = False
-                    total_cost = 0
-                    for item_id, qty in items:
-                        row = rows[item_id]
-                        current_version = int(row['version'])
-                        new_stock = int(row['stock']) - int(qty)
-                        new_version = current_version + 1
-                        price = int(row['price'])
-
-                        if not repo.update_inventory_item_versioned(item_id, new_stock, new_version, current_version):
-                            conflict = True
-                            break
-
-                        total_cost += price * int(qty)
-
-                    if not conflict:
-                        # Store deterministic result in inbox for idempotent replay.
-                        repo.set_inbox_event_result(
-                            event_id=event_id,
-                            status='PROCESSED',
-                            result={"status": "success", "amount": total_cost},
-                        )
-                        
-                        # log to outbox
-                        repo.insert_outbox_message(
-                            'order.request',
-                            utils.build_stock_allocated_event(
-                                correlation_id=correlation_id,
-                                order_id=order_id,
-                                amount=total_cost,
-                            ),
-                        )
-
-                        return utils.Success(total_cost)
-                    
-                    
-                    conn.rollback()
-                    app.logger.warning(f"Version conflict in batch stock update, retry {attempt + 1}/{MAX_RETRIES}")
-                    
-                    # TODO Add option for transient failure (RETRYABLE_FAILURE in case of max retry reached)
-                    if attempt == MAX_RETRIES - 1:
-                        repo.set_inbox_event_result(
-                            event_id=event_id,
-                            status='PROCESSED',
-                            result={"status": "failure", "reason": "version conflict"},
-                        )
-
-                        repo.insert_outbox_message(
-                            'order.request',
-                            utils.build_stock_unavailable_event(
-                                correlation_id=correlation_id,
-                                order_id=order_id,
-                            ),
-                        )
-
-                    
-
-        except psycopg.Error as e:
-            app.logger.error(f"Stock subtraction failed: {e}")
-            return utils.Failure("Database error during stock subtraction")
-
-    # Write failure on outbox
-
-    return utils.Failure("Too many concurrent updates, please retry")
+    if event.event_type == utils.Commands.FREE_STOCK and result.get("status") == "success":
+        response_event = utils.build_stock_freed_event(
+            correlation_id=correlation_id,
+            order_id=event.payload.order_id,
+        )
+        response_event.id = f"stock-compensation:{event.id}"
+        repo.insert_outbox_message("order.request", response_event)
 
 @app.post('/item/create/<price>')
 def create_item(price: int):

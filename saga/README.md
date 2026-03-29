@@ -47,22 +47,21 @@ After coding the REST endpoint logic run `docker-compose up --build` in the base
 (you can use the provided tests in the `\test` folder and change them as you wish). 
 
 The compose setup includes:
-- `kafka-init`: manually creates application topics (`stock.request`, `payment.request`, `order.request`, `checkout-results`) with 6 partitions and replication factor 1
+- `kafka-init`: manually creates application topics (`stock.request`, `payment.request`, `order.request`, `checkout-commands`, `checkout-results`) with 6 partitions and replication factor 1
 - dedicated `*-consumer` and `*-producer` containers for Kafka consumption and outbox publication
 - `order-checkout-worker` (Uvicorn/FastAPI) as the async HTTP worker for `/orders/checkout/*`
 
 Checkout worker flow (Kafka waiter):
-- `POST /orders/checkout/{order_id}` calls order-service once at `POST /checkout/start/{order_id}`
-- order-service remains source of truth and starts the saga, returning `correlation_id`
+- `POST /orders/checkout/{order_id}` generates `correlation_id`, registers local waiter, and emits `checkout.command` to Kafka topic `checkout-commands`
+- order consumer starts the saga using the command `correlation_id`
 - checkout-worker waits in-memory for a matching terminal event from Kafka topic `checkout-results`
 - terminal `completed` returns HTTP 200; terminal `failed`/`compensated` returns HTTP 400
-- timeout returns HTTP 202 with `status: pending`, `order_id`, and `correlation_id` (no polling, no 504)
+- request remains open until terminal result arrives (no polling, no 202/504 timeout response)
 
 Checkout worker env vars:
-- `ORDER_SERVICE_URL`
-- `CHECKOUT_TIMEOUT_SECONDS`
 - `CHECKOUT_MAX_INFLIGHT`
 - `KAFKA_BOOTSTRAP_SERVERS`
+- `CHECKOUT_COMMANDS_TOPIC`
 - `CHECKOUT_RESULTS_TOPIC`
 - `CHECKOUT_WORKER_GROUP_ID` (base id; worker appends host/pid for per-process uniqueness)
 

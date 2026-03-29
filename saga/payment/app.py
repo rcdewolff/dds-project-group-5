@@ -47,16 +47,14 @@ def init_db_pool():
 
 
 def consume_messages(consumer):
-    """Background task to process Kafka messages."""
-    print("Kafka consumer started...")
+    """Process Kafka messages with one DB transaction per event."""
+    app.logger.info("Payment consumer started")
     for message in consumer:
         result = utils.decode_and_type_event(message)
         if isinstance(result, utils.Failure):
-            print(f"Failed to decode message: {result.error}")
-            # TODO Handle validation error response
-
+            app.logger.error("Payment decode failed: %s", result.error)
             continue
-            
+
         event = result.value
         correlation_id = utils.event_correlation_id(event)
 
@@ -64,6 +62,11 @@ def consume_messages(consumer):
             with conn.cursor(row_factory=dict_row) as cur:
                 repo = PaymentRepository(cur)
                 if repo.inbox_event_exists(event.id):
+                    inbox_result = repo.get_inbox_event_result(event.id) or {
+                        "status": "failure",
+                        "reason": "duplicate_event",
+                    }
+                    _emit_payment_result(repo, event, correlation_id, inbox_result)
                     app.logger.info("Payment inbox dedupe hit event_id=%s correlation_id=%s", event.id, correlation_id)
                     conn.commit()
                     continue
@@ -79,39 +82,92 @@ def consume_messages(consumer):
                     payload_hash=utils.payload_hash(raw_payload),
                 )
 
-        print(f"Received message on topic {message.topic}: {event.event_type}.") 
-        handle_checkout(event)
-
-        with db_pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                repo = PaymentRepository(cur)
+                checkout_result = _handle_checkout(repo, event, correlation_id)
                 repo.set_inbox_event_result(
                     event_id=event.id,
                     status="PROCESSED",
-                    result={"status": "processed", "event_type": event.event_type},
+                    result=checkout_result,
+                    error=checkout_result.get("reason") if checkout_result.get("status") == "failure" else None,
                 )
+                _emit_payment_result(repo, event, correlation_id, checkout_result)
+                conn.commit()
 
 
-def dispatch_event(event: utils.BaseEvent):
-    if event.event_type == utils.Commands.START_PAYMENT:
-        handle_checkout(event)
+def _handle_checkout(repo: PaymentRepository, event: utils.BaseEvent, correlation_id: str) -> dict[str, int | str]:
+    if event.event_type != utils.Commands.START_PAYMENT:
+        return {"status": "failure", "reason": "unsupported_event_type"}
+
+    amount = int(event.payload.amount)
+    user_id = event.payload.user_id
+    order_id = event.payload.order_id
+    max_retries = 3
+
+    for _ in range(max_retries):
+        row = repo.get_account(user_id)
+        if row is None:
+            return {"status": "failure", "reason": "user_not_found"}
+
+        current_credit = int(row["credit"])
+        current_version = int(row["version"])
+
+        if current_credit < amount:
+            return {"status": "failure", "reason": "insufficient_credit"}
+
+        new_credit = current_credit - amount
+        new_version = current_version + 1
+        updated = repo.update_account_versioned(
+            user_id=user_id,
+            credit=new_credit,
+            new_version=new_version,
+            current_version=current_version,
+        )
+        if updated:
+            app.logger.info("Payment succeeded order_id=%s user_id=%s", order_id, user_id)
+            return {
+                "status": "success",
+                "remaining_credit": new_credit,
+                "amount": amount,
+            }
+
+    return {"status": "failure", "reason": "version_conflict"}
+
+
+def _emit_payment_result(
+    repo: PaymentRepository,
+    event: utils.BaseEvent,
+    correlation_id: str,
+    result: dict[str, int | str],
+) -> None:
+    if result.get("status") == "success":
+        payload = utils.PaymentProcessedPayload(
+            order_id=event.payload.order_id,
+            user_id=event.payload.user_id,
+            amount=int(result.get("amount", event.payload.amount)),
+            remaining_credit=int(result.get("remaining_credit", 0)),
+        )
+        event_type = utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED
     else:
-        print(f"Unknown event type: {event.event_type}")
+        payload = utils.PaymentFailedPayload(
+            order_id=event.payload.order_id,
+            user_id=event.payload.user_id,
+            amount=event.payload.amount,
+            reason=str(result.get("reason", "payment_failed")),
+        )
+        event_type = utils.PaymentIntegrationEvent.PAYMENT_FAILED
 
-
-def handle_checkout(event: utils.BaseEvent):
-    # Create Query
-    result = remove_user_credit(event)
-
-    # print(f"Payment processing result for user: {event.payload.user_id}, order: {event.payload.order_id}: {result}")
-    # If valid, emit valid event
-    if isinstance(result, utils.Success):
-        # Log the message and result for debugging
-        print(f"Payment succeeded for user: {event.payload.user_id}, order: {event.payload.order_id}. Remaining credit: {result.value}")
-    
-    else: 
-        print(f"Payment failed for user: {event.payload.user_id}, order: {event.payload.order_id}. Reason: {result.error}")
-        
+    repo.insert_outbox_message(
+        topic="order.request",
+        payload=utils.BaseEvent(
+            id=f"payment-result:{event.id}",
+            event_type=event_type,
+            payload=payload,
+            order_id=event.payload.order_id,
+            correlation_id=correlation_id,
+            saga_id=correlation_id,
+        ),
+        message_key=correlation_id,
+        correlation_id=correlation_id,
+    )
 
 
 
@@ -233,124 +289,6 @@ def remove_user_credit_direct(user_id: str, amount: int):
 
                     conn.rollback()
                     app.logger.warning(f"Version conflict user {user_id}, retry {attempt + 1}/{MAX_RETRIES}")
-
-        except psycopg.Error as e:
-            app.logger.error(f"Database error: {e}")
-            return utils.Failure(DB_ERROR_STR)
-
-    return utils.Failure("Too many concurrent updates, please retry")
-
-
-def remove_user_credit(event: utils.BaseEvent) :
-    app.logger.debug(f"Removing {event.payload.amount} credit from user: {event.payload.user_id}")
-    MAX_RETRIES = 3
-    for attempt in range(MAX_RETRIES):
-        try:
-            with db_pool.connection() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    repo = PaymentRepository(cur)
-                    correlation_id = utils.event_correlation_id(event)
-                    row = repo.get_account(event.payload.user_id)
-                    if row is None:
-                        # Write Outbox message for failed payment due to user not found
-                        repo.insert_outbox_message(
-                            topic="order.request",
-                            payload=utils.BaseEvent(
-                                id=str(uuid.uuid4()),
-                                event_type=utils.PaymentIntegrationEvent.PAYMENT_FAILED,
-                                payload=utils.PaymentFailedPayload(
-                                    order_id=event.payload.order_id,  # This would be filled in a real implementation
-                                    user_id=event.payload.user_id,
-                                    amount=event.payload.amount,
-                                    reason="User not found"
-                                ),
-                                order_id=event.payload.order_id,
-                                correlation_id=correlation_id,
-                                saga_id=correlation_id,
-                            ),
-                            message_key=correlation_id,
-                            correlation_id=correlation_id,
-                        )
-                        return utils.Failure(f"User: {event.payload.user_id} not found")
-
-                    current_credit = int(row['credit'])
-                    current_version = int(row['version'])
-
-                    if current_credit - int(event.payload.amount) < 0:
-                        # Write outbox message for failed payment due to insufficient credit
-                        repo.insert_outbox_message(
-                            topic="order.request",
-                            payload=utils.BaseEvent(
-                                id=str(uuid.uuid4()),
-                                event_type=utils.PaymentIntegrationEvent.PAYMENT_FAILED,
-                                payload=utils.PaymentFailedPayload(
-                                    order_id=event.payload.order_id,  # This would be filled in a real implementation
-                                    user_id=event.payload.user_id,
-                                    amount=event.payload.amount,
-                                    reason="Insufficient credit"
-                                ),
-                                order_id=event.payload.order_id,
-                                correlation_id=correlation_id,
-                                saga_id=correlation_id,
-                            ),
-                            message_key=correlation_id,
-                            correlation_id=correlation_id,
-                        )
-                        return utils.Failure("Insufficient credit")
-
-                    new_credit = current_credit - int(event.payload.amount)
-                    new_version = current_version + 1
-
-                    if repo.update_account_versioned(event.payload.user_id, new_credit, new_version, current_version):
-                        app.logger.info(f"User: {event.payload.user_id} credit updated to: {new_credit}")
-                        # Write to outbox
-                        repo.insert_outbox_message(
-                            topic="order.request",
-                            payload=utils.BaseEvent(
-                                id=str(uuid.uuid4()),
-                                event_type=utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED,
-                                payload=utils.PaymentProcessedPayload(
-                                    order_id=event.payload.order_id,  # This would be filled in a real implementation
-                                    user_id=event.payload.user_id,
-                                    amount=event.payload.amount,
-                                    remaining_credit=new_credit
-                                ),
-                                order_id=event.payload.order_id,
-                                correlation_id=correlation_id,
-                                saga_id=correlation_id,
-                            ),
-                            message_key=correlation_id,
-                            correlation_id=correlation_id,
-                        )  
-                        return utils.Success(new_credit)
-                        
-
-                    
-                    # Conflict detected — rollback and retry
-                    conn.rollback()
-                    app.logger.warning(f"Version conflict user {event.payload.user_id}, retry {attempt + 1}/{MAX_RETRIES}")
-                    
-                    if attempt == MAX_RETRIES - 1:
-                    # Write outbox message for failed payment due to version conflict
-                        repo.insert_outbox_message(
-                            topic="order.request",
-                            payload=utils.BaseEvent(
-                                id=str(uuid.uuid4()),
-                                event_type=utils.PaymentIntegrationEvent.PAYMENT_FAILED,
-                                payload=utils.PaymentFailedPayload(
-                                    order_id=event.payload.order_id,  # This would be filled in a real implementation
-                                    user_id=event.payload.user_id,
-                                    amount=event.payload.amount,
-                                    reason="Version conflict, please retry"
-                                ),
-                                order_id=event.payload.order_id,
-                                correlation_id=correlation_id,
-                                saga_id=correlation_id,
-                            ),
-                            message_key=correlation_id,
-                            correlation_id=correlation_id,
-                        )
-                        
 
         except psycopg.Error as e:
             app.logger.error(f"Database error: {e}")

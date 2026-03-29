@@ -30,7 +30,7 @@ class OutboxRelay:
 	def from_env(
 		cls,
 		service_name: str = "order-outbox-relay",
-		poll_interval: float = 0.01,
+		poll_interval: float = 0.05,
 		fetch_batch_size: int = 10,
 	) -> tuple["OutboxRelay", ConnectionPool, Any]:
 		"""Build a standalone relay from environment variables."""
@@ -77,7 +77,6 @@ class OutboxRelay:
 		self._run()
 
 	def _run(self):
-		logger.info("Outbox relay loop started with poll interval %.2fs and batch size %d", self.poll_interval, self.fetch_batch_size)
 		while not self._stop_event.is_set():
 			sent = self.relay_oldest_unsent()
 			if not sent:
@@ -110,8 +109,6 @@ class OutboxRelay:
 					if not rows:
 						return False
 					
-					logger.info("Found %d unsent outbox messages", len(rows))
-
 					relayed_count = 0
 					for row in rows:
 						try:
@@ -133,13 +130,6 @@ class OutboxRelay:
 								(row["id"],),
 							)
 							relayed_count += 1
-							logger.info(
-								"Outbox relayed id=%s event_id=%s correlation_id=%s topic=%s",
-								row["id"],
-								row["event_id"],
-								row["correlation_id"],
-								row["topic"],
-							)
 						except Exception as row_exc:
 							cur.execute(
 								"""
@@ -213,7 +203,7 @@ def _parse_fetch_batch_size(raw_value: str) -> int:
 def main():
 	logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 	logging.getLogger("kafka").setLevel(logging.INFO)
-	poll_interval = _parse_poll_interval(os.getenv("OUTBOX_POLL_INTERVAL", "0.5s"))
+	poll_interval = _parse_poll_interval(os.getenv("OUTBOX_POLL_INTERVAL", "0.05s"))
 
 	relay, db_pool, kafka = OutboxRelay.from_env(
 		poll_interval=poll_interval,

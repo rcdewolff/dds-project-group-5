@@ -186,6 +186,7 @@ class StockRepository:
             """
             INSERT INTO outbox (id, event_id, topic, message_key, correlation_id, payload)
             VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (event_id) DO NOTHING
             """,
             (
                 str(uuid.uuid4()),

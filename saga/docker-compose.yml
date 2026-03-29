@@ -68,9 +68,8 @@ services:
     image: order:latest
     command: uvicorn checkout_worker:app --host 0.0.0.0 --port 8001 --workers 1
     environment:
-      - ORDER_SERVICE_URL=http://order-service:5000
-      - CHECKOUT_TIMEOUT_SECONDS=35
-      - CHECKOUT_MAX_INFLIGHT=200
+      - CHECKOUT_MAX_INFLIGHT=600
+      - CHECKOUT_COMMANDS_TOPIC=checkout-commands
       - CHECKOUT_RESULTS_TOPIC=checkout-results
       - CHECKOUT_WORKER_GROUP_ID=checkout-worker
       - PYTHONUNBUFFERED=1

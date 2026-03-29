@@ -123,7 +123,26 @@ def _upsert_saga(cur, saga_id: str, order_id: str, status: str, step: str, resul
     )
 
 
-def start_checkout(cur, order_id: str, user_id: str, items: list[tuple[str, int]]) -> tuple[str, bool]:
+def start_checkout(
+    cur,
+    order_id: str,
+    user_id: str,
+    items: list[tuple[str, int]],
+    correlation_id: str | None = None,
+) -> tuple[str, bool]:
+    if correlation_id:
+        cur.execute(
+            """
+            SELECT id
+            FROM sagas
+            WHERE id = %s
+            """,
+            (correlation_id,),
+        )
+        existing_by_id = cur.fetchone()
+        if existing_by_id:
+            return existing_by_id["id"], False
+
     cur.execute(
         """
         SELECT id, status
@@ -138,9 +157,13 @@ def start_checkout(cur, order_id: str, user_id: str, items: list[tuple[str, int]
     if existing and existing["status"] in ACTIVE_STATUSES:
         return existing["id"], False
 
-    correlation_id = str(uuid.uuid4())
-    topic, payload = utils.build_reserve_stock_command(correlation_id, order_id, items)
-    event = json.decode(payload, type=utils.BaseEvent[dict])
+    saga_id = correlation_id or str(uuid.uuid4())
+    topic = "stock.request"
+    event = utils.reserve_stock_command_event(
+        correlation_id=saga_id,
+        order_id=order_id,
+        items=items,
+    )
 
     results = {
         "order_snapshot": {
@@ -158,14 +181,14 @@ def start_checkout(cur, order_id: str, user_id: str, items: list[tuple[str, int]
 
     _upsert_saga(
         cur,
-        saga_id=correlation_id,
+        saga_id=saga_id,
         order_id=order_id,
         status="running",
         step="STOCK_RESERVATION_PHASE",
         results=results,
     )
     _insert_outbox_event(cur, topic, event)
-    return correlation_id, True
+    return saga_id, True
 
 
 def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
@@ -195,13 +218,13 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
         order_id = snapshot.get("order_id", saga["order_id"])
         user_id = snapshot.get("user_id", "")
 
-        topic, payload = utils.build_start_payment_command(
+        topic = "payment.request"
+        payment_event = utils.start_payment_command_event(
             correlation_id=correlation_id,
             order_id=order_id,
             user_id=user_id,
             amount=amount,
         )
-        payment_event = json.decode(payload, type=utils.BaseEvent[dict])
 
         results["stock"] = {"status": "success", "amount": amount}
         results["transitions"].append({"event_type": event.event_type, "status": "success"})
@@ -266,12 +289,12 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
         raw_items = snapshot.get("items", [])
         items: list[tuple[str, int]] = [(item[0], int(item[1])) for item in raw_items]
 
-        topic, payload = utils.build_free_stock_command(
+        topic = "stock.request"
+        rollback_event = utils.free_stock_command_event(
             correlation_id=correlation_id,
             order_id=saga["order_id"],
             items=items,
         )
-        rollback_event = json.decode(payload, type=utils.BaseEvent[dict])
         reason = getattr(event.payload, "reason", "payment_failed")
 
         results["payment"] = {"status": "failed", "reason": reason}

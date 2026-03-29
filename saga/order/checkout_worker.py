@@ -3,37 +3,35 @@ import json
 import logging
 import os
 import socket
+import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
 
 
-ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://order-service:5000")
-CHECKOUT_TIMEOUT_SECONDS = float(os.getenv("CHECKOUT_TIMEOUT_SECONDS", "35"))
-CHECKOUT_MAX_INFLIGHT = int(os.getenv("CHECKOUT_MAX_INFLIGHT", "200"))
+CHECKOUT_MAX_INFLIGHT = int(os.getenv("CHECKOUT_MAX_INFLIGHT", "600"))
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+CHECKOUT_COMMANDS_TOPIC = os.getenv("CHECKOUT_COMMANDS_TOPIC", "checkout-commands")
 CHECKOUT_RESULTS_TOPIC = os.getenv("CHECKOUT_RESULTS_TOPIC", "checkout-results")
 CHECKOUT_WORKER_GROUP_ID = os.getenv("CHECKOUT_WORKER_GROUP_ID", "checkout-worker")
 
 TERMINAL_STATUSES = {"completed", "failed", "compensated"}
-WAIT_SLICE_SECONDS = 0.5
 
 logger = logging.getLogger("checkout-worker")
 
 
 @dataclass(slots=True)
 class WorkerState:
-    http_client: httpx.AsyncClient
+    producer: KafkaProducer
     consumer: KafkaConsumer
     consumer_task: asyncio.Task[None]
     stop_event: asyncio.Event
-    waiters: dict[str, set[asyncio.Future[dict[str, Any]]]] = field(default_factory=dict)
+    waiters: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
     waiters_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     inflight_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(CHECKOUT_MAX_INFLIGHT))
     inflight_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -41,6 +39,7 @@ class WorkerState:
 
 
 def _map_final_status(status_payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Map terminal saga status to HTTP response."""
     status = status_payload.get("status")
     body = {
         "status": "success" if status == "completed" else "failed",
@@ -52,13 +51,9 @@ def _map_final_status(status_payload: dict[str, Any]) -> tuple[int, dict[str, An
     if status == "completed":
         body["message"] = "Checkout completed successfully."
         return 200, body
-    if status in {"failed", "compensated"}:
-        body["message"] = "Checkout failed."
-        return 400, body
-    return 500, {
-        "status": "failed",
-        "message": f"Unexpected final saga status: {status}",
-    }
+    # failed or compensated
+    body["message"] = "Checkout failed."
+    return 400, body
 
 
 def _worker_group_id() -> str:
@@ -73,6 +68,13 @@ def _build_consumer() -> KafkaConsumer:
         auto_offset_reset="latest",
         enable_auto_commit=True,
         consumer_timeout_ms=1000,
+    )
+
+
+def _build_producer() -> KafkaProducer:
+    return KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        value_serializer=lambda value: json.dumps(value).encode("utf-8"),
     )
 
 
@@ -115,23 +117,34 @@ async def _register_waiter(state: WorkerState, correlation_id: str) -> asyncio.F
     loop = asyncio.get_running_loop()
     waiter: asyncio.Future[dict[str, Any]] = loop.create_future()
     async with state.waiters_lock:
-        bucket = state.waiters.setdefault(correlation_id, set())
-        bucket.add(waiter)
+        state.waiters[correlation_id] = waiter
     return waiter
 
 
 async def _remove_waiter(
     state: WorkerState,
     correlation_id: str,
-    waiter: asyncio.Future[dict[str, Any]],
 ) -> None:
     async with state.waiters_lock:
-        bucket = state.waiters.get(correlation_id)
-        if not bucket:
-            return
-        bucket.discard(waiter)
-        if not bucket:
-            state.waiters.pop(correlation_id, None)
+        state.waiters.pop(correlation_id, None)
+
+
+async def _publish_checkout_command(state: WorkerState, *, correlation_id: str, order_id: str) -> None:
+    command_event = {
+        "id": str(uuid.uuid4()),
+        "event_type": "checkout.command",
+        "correlation_id": correlation_id,
+        "order_id": order_id,
+        "timestamp": time.time(),
+    }
+
+    send_future = await asyncio.to_thread(
+        state.producer.send,
+        CHECKOUT_COMMANDS_TOPIC,
+        key=correlation_id.encode("utf-8"),
+        value=command_event,
+    )
+    await asyncio.to_thread(send_future.get, 10)
 
 
 async def _consume_checkout_results(state: WorkerState) -> None:
@@ -158,23 +171,32 @@ async def _consume_checkout_results(state: WorkerState) -> None:
                         continue
 
                     async with state.waiters_lock:
-                        bucket = state.waiters.pop(correlation_id, set())
-                    for waiter in bucket:
-                        if not waiter.done():
-                            waiter.set_result(decoded)
+                        waiter = state.waiters.pop(correlation_id, None)
+
+                    if waiter and not waiter.done():
+                        waiter.set_result(decoded)
         except Exception:
             logger.exception("checkout_result_consumer_loop_error")
             await asyncio.sleep(0.5)
 
 
+async def _cancel_all_waiters(state: WorkerState, reason: str) -> None:
+    async with state.waiters_lock:
+        pending = list(state.waiters.values())
+        state.waiters.clear()
+
+    for waiter in pending:
+        if not waiter.done():
+            waiter.set_exception(asyncio.CancelledError(reason))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=10.0)
-    http_client = httpx.AsyncClient(timeout=timeout)
+    producer = _build_producer()
     consumer = _build_consumer()
     stop_event = asyncio.Event()
     state = WorkerState(
-        http_client=http_client,
+        producer=producer,
         consumer=consumer,
         stop_event=stop_event,
         consumer_task=asyncio.create_task(asyncio.sleep(0)),
@@ -182,7 +204,8 @@ async def lifespan(app: FastAPI):
     state.consumer_task = asyncio.create_task(_consume_checkout_results(state))
     app.state.worker = state
     logger.info(
-        "checkout_worker_started topic=%s group_id=%s max_inflight=%s",
+        "checkout_worker_started command_topic=%s result_topic=%s group_id=%s max_inflight=%s",
+        CHECKOUT_COMMANDS_TOPIC,
         CHECKOUT_RESULTS_TOPIC,
         consumer.config.get("group_id"),
         CHECKOUT_MAX_INFLIGHT,
@@ -196,8 +219,10 @@ async def lifespan(app: FastAPI):
             await state.consumer_task
         except asyncio.CancelledError:
             pass
+        await _cancel_all_waiters(state, "worker shutdown")
+        await asyncio.to_thread(producer.flush, 5)
+        await asyncio.to_thread(producer.close)
         await asyncio.to_thread(consumer.close)
-        await http_client.aclose()
 
 
 app = FastAPI(title="order-checkout-worker", lifespan=lifespan)
@@ -208,83 +233,51 @@ async def checkout(order_id: str, request: Request):
     state: WorkerState = request.app.state.worker
 
     try:
-        await asyncio.wait_for(state.inflight_semaphore.acquire(), timeout=0.01)
+        await asyncio.wait_for(state.inflight_semaphore.acquire(), timeout=0.05)
     except TimeoutError:
-        raise HTTPException(status_code=503, detail={"status": "saturated", "message": "Too many in-flight checkout requests."})
+        raise HTTPException(
+            status_code=429,
+            detail={"status": "saturated", "message": "Too many in-flight checkout requests."},
+        )
 
     started_at = monotonic()
     acquired = True
-    correlation_id: str | None = None
+    correlation_id = str(uuid.uuid4())
 
     async with state.inflight_lock:
         state.inflight_count += 1
 
     try:
-        start_resp = await state.http_client.post(f"{ORDER_SERVICE_URL}/checkout/start/{order_id}")
-        if start_resp.status_code >= 400:
-            raise HTTPException(start_resp.status_code, detail=start_resp.text)
-
-        start_payload = start_resp.json()
-        correlation_id = start_payload.get("correlation_id")
-        if not correlation_id:
-            raise HTTPException(500, detail="Order service did not return correlation_id")
-
+        # Register waiter before publish to avoid command/result race windows.
         waiter = await _register_waiter(state, correlation_id)
         try:
-            deadline = monotonic() + CHECKOUT_TIMEOUT_SECONDS
-            while True:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    pending_body = {
-                        "status": "pending",
+            try:
+                await _publish_checkout_command(state, correlation_id=correlation_id, order_id=order_id)
+            except Exception as exc:
+                logger.exception("checkout_command_publish_failed order_id=%s correlation_id=%s", order_id, correlation_id)
+                raise HTTPException(
+                    status_code=400,
+                    detail={"status": "failed", "message": "Unable to enqueue checkout command.", "error": str(exc)},
+                )
+
+            status_payload = await asyncio.shield(waiter)
+            code, body = _map_final_status(status_payload)
+            logger.info(
+                json.dumps(
+                    {
                         "order_id": order_id,
                         "correlation_id": correlation_id,
+                        "total_ms": int((monotonic() - started_at) * 1000),
+                        "terminal_status": status_payload.get("status"),
+                        "inflight_count": state.inflight_count,
                     }
-                    logger.info(
-                        json.dumps(
-                            {
-                                "order_id": order_id,
-                                "correlation_id": correlation_id,
-                                "total_ms": int((monotonic() - started_at) * 1000),
-                                "terminal_status": None,
-                                "pending_returned": True,
-                                "inflight_count": state.inflight_count,
-                            }
-                        )
-                    )
-                    return JSONResponse(status_code=202, content=pending_body)
-
-                try:
-                    status_payload = await asyncio.wait_for(
-                        asyncio.shield(waiter),
-                        timeout=min(WAIT_SLICE_SECONDS, remaining),
-                    )
-                    code, body = _map_final_status(status_payload)
-                    logger.info(
-                        json.dumps(
-                            {
-                                "order_id": order_id,
-                                "correlation_id": correlation_id,
-                                "total_ms": int((monotonic() - started_at) * 1000),
-                                "terminal_status": status_payload.get("status"),
-                                "pending_returned": False,
-                                "inflight_count": state.inflight_count,
-                            }
-                        )
-                    )
-                    if code >= 400:
-                        raise HTTPException(code, detail=body)
-                    return body
-                except TimeoutError:
-                    if await request.is_disconnected():
-                        logger.info(
-                            "checkout_client_disconnected order_id=%s correlation_id=%s",
-                            order_id,
-                            correlation_id,
-                        )
-                        raise HTTPException(status_code=499, detail="Client disconnected")
+                )
+            )
+            if code >= 400:
+                raise HTTPException(code, detail=body)
+            return body
         finally:
-            await _remove_waiter(state, correlation_id, waiter)
+            await _remove_waiter(state, correlation_id)
             if not waiter.done():
                 waiter.cancel()
     finally:
