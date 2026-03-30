@@ -71,6 +71,8 @@ services:
 
   order-consumer:
     build: ./order
+    deploy:
+      replicas: 6
     volumes:
       - ./order:/home/flask-app/
       - ./services:/home/flask-app/services
@@ -99,7 +101,7 @@ services:
     image: order:latest
     environment:
       - PYTHONUNBUFFERED=1
-      - OUTBOX_POLL_INTERVAL=0.5
+      - OUTBOX_POLL_INTERVAL=0.05
     command: python producer.py
     env_file:
       - env/order_citus.env
@@ -170,6 +172,8 @@ services:
 
   stock-consumer:
     build: ./stock
+    deploy:
+      replicas: 6
     environment:
       - PYTHONUNBUFFERED=1
     volumes:
@@ -198,7 +202,7 @@ services:
     image: stock:latest
     environment:
       - PYTHONUNBUFFERED=1
-      - OUTBOX_POLL_INTERVAL=0.5
+      - OUTBOX_POLL_INTERVAL=0.05
     command: python producer.py
     env_file:
       - env/stock_citus.env
@@ -269,6 +273,8 @@ services:
 
   payment-consumer:
     build: ./payment
+    deploy:
+      replicas: 6
     volumes:
       - ./payment:/home/flask-app/
       - ./services:/home/flask-app/services
@@ -298,7 +304,7 @@ services:
     command: python producer.py
     environment:
       - PYTHONUNBUFFERED=1
-      - OUTBOX_POLL_INTERVAL=0.5
+      - OUTBOX_POLL_INTERVAL=0.05
     env_file:
       - env/payment_citus.env
       - env/kafka_settings.env
