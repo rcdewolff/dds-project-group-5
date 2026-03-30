@@ -278,7 +278,7 @@ def main():
 
     for message in consumer:
         message_count += 1
-        if message_count % 250 == 0:
+        if message_count % 100 == 0:
             _cleanup_inbox(db_pool)
 
         if message.topic == CHECKOUT_COMMANDS_TOPIC:
