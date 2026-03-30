@@ -18,7 +18,7 @@ from flask import Flask, jsonify, abort, Response, request
 from kafka_service import kafka_client
 from kafka_service.kafka_event import BaseEvent, OrderPayload, CheckoutPayload
 from kafka_service.consumer_handler import EventConsumer
-from coordinator import TwoPhaseCommitCoordinator, Participant
+from coordinator import TwoPhaseCommitCoordinator, Participant, create_tables
 from coordinator.app import RECONCILE_INTERVAL
 
 DB_ERROR_STR = "DB error"
@@ -58,45 +58,15 @@ coordinator    = TwoPhaseCommitCoordinator(db_pool, timeout=10)
 # DB init
 # ---------------------------------------------------------------------------
 
+
 def init_db():
     with db_pool.connection() as conn:
+        create_tables(conn)  # ← orchestrator handles its own schema
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
-                    order_id   TEXT    PRIMARY KEY,
-                    paid       BOOLEAN NOT NULL,
-                    items      JSONB   NOT NULL,
-                    user_id    TEXT    NOT NULL,
-                    total_cost INTEGER NOT NULL
-                )
+                CREATE TABLE IF NOT EXISTS orders (...)
             """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS order_transactions (
-                    transaction_id TEXT PRIMARY KEY,
-                    order_id       TEXT NOT NULL,
-                    status         TEXT NOT NULL,
-                    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS tx_participants (
-                    transaction_id  TEXT    NOT NULL,
-                    participant_name TEXT   NOT NULL,
-                    acked           BOOLEAN NOT NULL DEFAULT FALSE,
-                    PRIMARY KEY (transaction_id, participant_name)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS event_log (
-                    correlation_id TEXT   PRIMARY KEY,
-                    event_type     TEXT   NOT NULL,
-                    service        TEXT   NOT NULL,
-                    topic          TEXT   NOT NULL,
-                    kafka_offset   BIGINT NOT NULL,
-                    payload        JSONB  NOT NULL,
-                    received_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # rest of your app tables
             conn.commit()
 
 
