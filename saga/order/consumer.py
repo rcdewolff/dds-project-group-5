@@ -47,7 +47,7 @@ def _cleanup_inbox(db_pool: ConnectionPool) -> None:
                     """
                     DELETE FROM inbox
                     WHERE status = 'PROCESSED'
-                    AND processed_at < now() - interval '10 minutes'
+                    AND processed_at < now() - interval '1 minutes'
                     """
                 )
             conn.commit()
@@ -278,7 +278,7 @@ def main():
 
     for message in consumer:
         message_count += 1
-        if message_count % 500 == 0:
+        if message_count % 250 == 0:
             _cleanup_inbox(db_pool)
 
         if message.topic == CHECKOUT_COMMANDS_TOPIC:

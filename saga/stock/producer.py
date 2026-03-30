@@ -95,7 +95,7 @@ class OutboxRelay:
 						"""
 						DELETE FROM outbox
 						WHERE status = 'PUBLISHED'
-						AND published_at < now() - interval '5 minutes'
+						AND published_at < now() - interval '1 minutes'
 						"""
 					)
 				conn.commit()
