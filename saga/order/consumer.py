@@ -38,6 +38,24 @@ def init_db_pool() -> ConnectionPool:
     )
 
 
+def _cleanup_inbox(db_pool: ConnectionPool) -> None:
+    """Delete old processed inbox rows to prevent table bloat."""
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM inbox
+                    WHERE status = 'PROCESSED'
+                    AND processed_at < now() - interval '10 minutes'
+                    """
+                )
+            conn.commit()
+            logger.debug("Inbox cleanup completed")
+    except Exception as exc:
+        logger.warning("Inbox cleanup failed: %s", exc)
+
+
 def _mark_inbox_received(cur, message, event: utils.BaseEvent) -> bool:
     raw_payload = message.value.decode() if isinstance(message.value, bytes) else str(message.value)
     cur.execute(
@@ -256,8 +274,13 @@ def main():
     client = kafka_client.Client(service_name, [f"{service_name}.request", CHECKOUT_COMMANDS_TOPIC])
     consumer = client.consumer
     db_pool = init_db_pool()
+    message_count = 0
 
     for message in consumer:
+        message_count += 1
+        if message_count % 500 == 0:
+            _cleanup_inbox(db_pool)
+
         if message.topic == CHECKOUT_COMMANDS_TOPIC:
             try:
                 command = _decode_checkout_command(message)

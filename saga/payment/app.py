@@ -39,17 +39,38 @@ def init_db_pool():
                 f"dbname={conn_params['dbname']}",
         min_size=1,
         max_size=10,
-        # Reconnection policy
         reconnect_timeout=30,
         kwargs={"connect_timeout": 10}
     )
 
 
+def _cleanup_inbox() -> None:
+    """Delete old processed inbox rows to prevent table bloat."""
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM inbox
+                    WHERE status = 'PROCESSED'
+                    AND processed_at < now() - interval '10 minutes'
+                    """
+                )
+            conn.commit()
+            app.logger.debug("Payment inbox cleanup completed")
+    except Exception as exc:
+        app.logger.warning("Payment inbox cleanup failed: %s", exc)
+
 
 def consume_messages(consumer):
     """Process Kafka messages with one DB transaction per event."""
     app.logger.info("Payment consumer started")
+    message_count = 0
     for message in consumer:
+        message_count += 1
+        if message_count % 500 == 0:
+            _cleanup_inbox()
+
         result = utils.decode_and_type_event(message)
         if isinstance(result, utils.Failure):
             app.logger.error("Payment decode failed: %s", result.error)
@@ -170,8 +191,6 @@ def _emit_payment_result(
     )
 
 
-
-
 def init_db():
     """Initialize payment persistence tables."""
     tmp_pool = init_db_pool()
@@ -252,7 +271,6 @@ def find_user(user_id: str):
 
 @app.post('/pay/<user_id>/<amount>')
 def http_remove_credit(user_id: str, amount: int):
-    # Direct HTTP mode: update state and reply immediately without inbox/outbox writes.
     result = remove_user_credit_direct(user_id, int(amount))
     if isinstance(result, utils.Success):
         return Response(f"User: {user_id} credit updated to: {result.value}", status=200)
@@ -261,7 +279,7 @@ def http_remove_credit(user_id: str, amount: int):
 
 def load_aggregate_state():
     """Load aggregate state from database on startup"""
-    # Extract all the events related to 
+    pass
 
 
 def remove_user_credit_direct(user_id: str, amount: int):

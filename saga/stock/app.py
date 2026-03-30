@@ -23,7 +23,6 @@ kafka_producer = None
 kafka_consumer = None
 
 
-# Create connection pool
 conn_params = {
     'host': os.environ['POSTGRES_HOST'],
     'port': int(os.environ['POSTGRES_PORT']),
@@ -43,7 +42,6 @@ def init_db_pool():
                 f"dbname={conn_params['dbname']}",
         min_size=1,
         max_size=10,
-        # Reconnection policy
         reconnect_timeout=30,
         kwargs={"connect_timeout": 10}
     )
@@ -55,8 +53,6 @@ def init_db():
         with conn.cursor() as cur:
             repo = StockRepository(cur)
             repo.create_tables()
-
-            
     tmp_pool.close()
 
 def close_db_connection():
@@ -74,6 +70,23 @@ class StockValue(Struct):
     price: int
 
 
+def _cleanup_inbox() -> None:
+    """Delete old processed inbox rows to prevent table bloat."""
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM inbox
+                    WHERE status = 'PROCESSED'
+                    AND processed_at < now() - interval '10 minutes'
+                    """
+                )
+            conn.commit()
+            app.logger.debug("Stock inbox cleanup completed")
+    except Exception as exc:
+        app.logger.warning("Stock inbox cleanup failed: %s", exc)
+
 
 def get_item_from_db(item_id: str) -> StockValue | None:
     try:
@@ -90,11 +103,15 @@ def get_item_from_db(item_id: str) -> StockValue | None:
         return abort(400, DB_ERROR_STR)
 
 
-
 def consume_messages(consumer):
     """Process Kafka messages with one DB transaction per event."""
     app.logger.info("Stock consumer started")
+    message_count = 0
     for message in consumer:
+        message_count += 1
+        if message_count % 500 == 0:
+            _cleanup_inbox()
+
         result = utils.decode_and_type_event(message)
         if isinstance(result, utils.Failure):
             app.logger.error("Stock decode failed: %s", result.error)
@@ -236,6 +253,7 @@ def _emit_stock_result(
         response_event.id = f"stock-compensation:{event.id}"
         repo.insert_outbox_message("order.request", response_event)
 
+
 @app.post('/item/create/<price>')
 def create_item(price: int):
     key = str(uuid.uuid4())
@@ -257,7 +275,7 @@ def get_items():
             repo = StockRepository(cur)
             items = repo.list_inventory()
             return jsonify(items)
-    
+
 
 @app.post('/batch_init/<n>/<starting_stock>/<item_price>')
 def batch_init_users(n: int, starting_stock: int, item_price: int):
@@ -348,8 +366,6 @@ def remove_stock(item_id: str, amount: int):
             return abort(400, DB_ERROR_STR)
 
     return abort(409, "Too many concurrent updates, please retry")
-
-
 
 
 if __name__ == '__main__':
