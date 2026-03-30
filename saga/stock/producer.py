@@ -25,6 +25,7 @@ class OutboxRelay:
 		self.fetch_batch_size = fetch_batch_size
 		self._stop_event = threading.Event()
 		self._thread: threading.Thread | None = None
+		self._cycle = 0
 
 	@classmethod
 	def from_env(
@@ -61,7 +62,7 @@ class OutboxRelay:
 		if self._thread is not None and self._thread.is_alive():
 			return
 		self._stop_event.clear()
-		self._thread = threading.Thread(target=self._run, daemon=True, name="payment-outbox-relay")
+		self._thread = threading.Thread(target=self._run, daemon=True, name="stock-outbox-relay")
 		self._thread.start()
 		logger.info("Outbox relay started")
 
@@ -81,6 +82,26 @@ class OutboxRelay:
 			sent = self.relay_oldest_unsent()
 			if not sent:
 				time.sleep(self.poll_interval)
+			self._cycle += 1
+			if self._cycle % 100 == 0:
+				self._cleanup_published()
+
+	def _cleanup_published(self) -> None:
+		"""Delete old published outbox rows to prevent table bloat."""
+		try:
+			with self.db_pool.connection() as conn:
+				with conn.cursor() as cur:
+					cur.execute(
+						"""
+						DELETE FROM outbox
+						WHERE status = 'PUBLISHED'
+						AND published_at < now() - interval '5 minutes'
+						"""
+					)
+				conn.commit()
+				logger.debug("Outbox cleanup completed")
+		except Exception as exc:
+			logger.warning("Outbox cleanup failed: %s", exc)
 
 	def relay_oldest_unsent(self) -> bool:
 		"""
@@ -114,7 +135,6 @@ class OutboxRelay:
 							event = _payload_to_base_event(row["payload"])
 							message_key = str(row["message_key"]).encode("utf-8")
 							future = self.kafka_producer.send(topic=row["topic"], key=message_key, value=event)
-							# Ensure broker ack before marking as sent to avoid message loss.
 							future.get(timeout=10)
 
 							cur.execute(
@@ -139,7 +159,6 @@ class OutboxRelay:
 								""",
 								(str(row_exc), row["id"]),
 							)
-							# Leave failed rows unsent so they can be retried later.
 							logger.exception(
 								"Outbox relay failed for row %s on topic %s correlation_id=%s: %s",
 								row.get("id"),
