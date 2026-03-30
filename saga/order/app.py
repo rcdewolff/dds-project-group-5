@@ -154,8 +154,8 @@ def close_db_connection():
     if db_pool is not None:
         db_pool.close()
 
-
-init_db()
+if os.getenv("INIT_DB", "true").lower() == "true":
+    init_db()
 atexit.register(close_db_connection)
 
 

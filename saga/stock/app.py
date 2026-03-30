@@ -64,7 +64,8 @@ def close_db_connection():
 
 
 # Initialize database on startup
-init_db()
+if os.getenv("INIT_DB", "true").lower() == "true":
+    init_db()
 atexit.register(close_db_connection)
 
 

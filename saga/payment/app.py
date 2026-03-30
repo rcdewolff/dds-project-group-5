@@ -186,7 +186,8 @@ def close_db_connection():
 
 
 # Initialize database on startup and create a shared pool
-init_db()
+if os.getenv("INIT_DB", "true").lower() == "true":
+    init_db()
 # create a global pool for the app to use
 db_pool = init_db_pool()
 atexit.register(close_db_connection)

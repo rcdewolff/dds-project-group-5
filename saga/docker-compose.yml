@@ -79,6 +79,7 @@ services:
     image: order:latest
     environment:
       - PYTHONUNBUFFERED=1
+      - INIT_DB=false
     command: python consumer.py
     env_file:
       - env/order_citus.env
@@ -176,6 +177,7 @@ services:
       replicas: 6
     environment:
       - PYTHONUNBUFFERED=1
+      - INIT_DB=false
     volumes:
       - ./stock:/home/flask-app/
       - ./services:/home/flask-app/services
@@ -282,6 +284,7 @@ services:
     command: python consumer.py
     environment:
       - PYTHONUNBUFFERED=1
+      - INIT_DB=false
     env_file:
       - env/payment_citus.env
       - env/kafka_settings.env
