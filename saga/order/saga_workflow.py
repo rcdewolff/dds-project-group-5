@@ -1,173 +1,25 @@
-import json as std_json
-import time
-import uuid
+"""Checkout workflow adapter.
+
+The order service supplies the concrete checkout steps here, while the generic
+Orchestrator class handles saga persistence, dispatch, and terminal reporting.
+"""
+
 from typing import Any
 
-from msgspec import json
-
+from orchestrator import Orchestrator, SagaDefinition, SagaDispatch, SagaDispatchContext, SagaTransition
 from services import utils
 
 
 FINAL_STATUSES = {"completed", "failed", "compensated"}
-ACTIVE_STATUSES = {"pending", "running", "compensating"}
-CHECKOUT_RESULTS_TOPIC = "checkout-results"
+ORCHESTRATOR = Orchestrator(final_statuses=FINAL_STATUSES)
 
 
-def _load_results(row: dict[str, Any]) -> dict[str, Any]:
-    value = row.get("results")
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            return std_json.loads(value)
-        except std_json.JSONDecodeError:
-            return {}
-    return {}
-
-
-async def _insert_outbox_event(cur, topic: str, event: utils.BaseEvent[Any]) -> None:
-    payload_text = json.encode(event).decode()
-    await cur.execute(
-        """
-        INSERT INTO outbox (
-            id,
-            event_id,
-            topic,
-            message_key,
-            correlation_id,
-            payload,
-            status,
-            publish_attempts,
-            created_at
-        )
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'PENDING', 0, now())
-        """,
-        (
-            str(uuid.uuid4()),
-            event.id,
-            topic,
-            utils.event_correlation_id(event),
-            utils.event_correlation_id(event),
-            payload_text,
-        ),
-    )
-
-
-async def _emit_checkout_terminal_result_once(
-    cur,
-    *,
-    correlation_id: str,
-    order_id: str,
-    status: str,
-    results: dict[str, Any],
-    error: str | None = None,
-) -> None:
-    event_payload = {
-        "event_type": "checkout.result",
-        "correlation_id": correlation_id,
-        "order_id": order_id,
-        "status": status,
-        "results": results,
-        "error": error,
-        "timestamp": time.time(),
-    }
-    event = utils.BaseEvent.create(
-        event_type="checkout.result",
-        payload=event_payload,
-        order_id=order_id,
-        correlation_id=correlation_id,
-        id=f"checkout-result:{correlation_id}",
-    )
-    payload_text = json.encode(event).decode()
-
-    await cur.execute(
-        """
-        INSERT INTO outbox (
-            id,
-            event_id,
-            topic,
-            message_key,
-            correlation_id,
-            payload,
-            status,
-            publish_attempts,
-            created_at
-        )
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'PENDING', 0, now())
-        ON CONFLICT (event_id) DO NOTHING
-        """,
-        (
-            str(uuid.uuid4()),
-            event.id,
-            CHECKOUT_RESULTS_TOPIC,
-            correlation_id,
-            correlation_id,
-            payload_text,
-        ),
-    )
-
-
-async def _upsert_saga(
-    cur, saga_id: str, order_id: str, status: str, step: str, results: dict[str, Any]
-) -> None:
-    await cur.execute(
-        """
-        INSERT INTO sagas (order_id, id, status, step, results)
-        VALUES (%s, %s, %s, %s, %s::jsonb)
-        ON CONFLICT (id) DO UPDATE
-        SET status = EXCLUDED.status,
-            step = EXCLUDED.step,
-            results = EXCLUDED.results
-        """,
-        (order_id, saga_id, status, step, std_json.dumps(results)),
-    )
-
-
-async def start_checkout(
-    cur,
-    order_id: str,
-    user_id: str,
-    items: list[tuple[str, int]],
-    correlation_id: str | None = None,
-) -> tuple[str, bool]:
-    if correlation_id:
-        await cur.execute(
-            "SELECT id FROM sagas WHERE id = %s",
-            (correlation_id,),
-        )
-        existing_by_id = await cur.fetchone()
-        if existing_by_id:
-            return existing_by_id["id"], False
-
-    await cur.execute(
-        """
-        SELECT id, status
-        FROM sagas
-        WHERE order_id = %s
-        ORDER BY created_at DESC NULLS LAST, id DESC
-        LIMIT 1
-        """,
-        (order_id,),
-    )
-    existing = await cur.fetchone()
-    if existing and existing["status"] in ACTIVE_STATUSES:
-        return existing["id"], False
-
-    saga_id = correlation_id or str(uuid.uuid4())
-    topic = "stock.request"
-    event = utils.reserve_stock_command_event(
-        correlation_id=saga_id,
-        order_id=order_id,
-        items=items,
-    )
-
-    results = {
+def _build_initial_results(saga_data: dict[str, Any]) -> dict[str, Any]:
+    return {
         "order_snapshot": {
-            "order_id": order_id,
-            "user_id": user_id,
-            "items": [[item_id, qty] for item_id, qty in items],
+            "order_id": saga_data["order_id"],
+            "user_id": saga_data["user_id"],
+            "items": [[item_id, qty] for item_id, qty in saga_data["items"]],
         },
         "transitions": [
             {
@@ -177,156 +29,129 @@ async def start_checkout(
         ],
     }
 
-    await _upsert_saga(
-        cur,
-        saga_id=saga_id,
-        order_id=order_id,
-        status="running",
-        step="STOCK_RESERVATION_PHASE",
-        results=results,
+
+def _build_reserve_stock_event(context: SagaDispatchContext) -> utils.BaseEvent[Any]:
+    snapshot = context.results["order_snapshot"]
+    items = [(item_id, int(quantity)) for item_id, quantity in snapshot["items"]]
+    return utils.reserve_stock_command_event(
+        correlation_id=context.saga_id,
+        order_id=snapshot["order_id"],
+        items=items,
     )
-    await _insert_outbox_event(cur, topic, event)
-    return saga_id, True
+
+
+def _build_start_payment_event(context: SagaDispatchContext) -> utils.BaseEvent[Any]:
+    snapshot = context.results["order_snapshot"]
+    amount = int(context.results.get("stock", {}).get("amount", 0))
+    return utils.start_payment_command_event(
+        correlation_id=context.saga_id,
+        order_id=snapshot["order_id"],
+        user_id=snapshot["user_id"],
+        amount=amount,
+    )
+
+
+def _build_free_stock_event(context: SagaDispatchContext) -> utils.BaseEvent[Any]:
+    snapshot = context.results["order_snapshot"]
+    items = [(item_id, int(quantity)) for item_id, quantity in snapshot["items"]]
+    return utils.free_stock_command_event(
+        correlation_id=context.saga_id,
+        order_id=snapshot["order_id"],
+        items=items,
+    )
+
+
+def _record_stock_reserved(cur, results: dict[str, Any], saga: dict[str, Any], event: utils.BaseEvent[Any]) -> None:
+    amount = int(getattr(event.payload, "amount", 0))
+    results["stock"] = {"status": "success", "amount": amount}
+
+
+def _record_stock_unavailable(cur, results: dict[str, Any], saga: dict[str, Any], event: utils.BaseEvent[Any]) -> None:
+    results["stock"] = {"status": "failed", "reason": "stock_unavailable"}
+
+
+async def _record_payment_success(cur, results: dict[str, Any], saga: dict[str, Any], event: utils.BaseEvent[Any]) -> None:
+    results["payment"] = {"status": "success"}
+    await cur.execute(
+        "UPDATE orders SET paid = TRUE WHERE order_id = %s",
+        (saga["order_id"],),
+    )
+
+
+def _record_payment_failure(cur, results: dict[str, Any], saga: dict[str, Any], event: utils.BaseEvent[Any]) -> None:
+    reason = getattr(event.payload, "reason", "payment_failed")
+    results["payment"] = {"status": "failed", "reason": reason}
+
+
+def _record_compensation_success(cur, results: dict[str, Any], saga: dict[str, Any], event: utils.BaseEvent[Any]) -> None:
+    results["compensation"] = {"status": "success"}
+
+
+CHECKOUT_SAGA_DEFINITION = SagaDefinition(
+    initial_status="running",
+    initial_step="STOCK_RESERVATION_PHASE",
+    build_initial_results=_build_initial_results,
+    initial_dispatch=SagaDispatch(
+        topic="stock.request",
+        build_event=_build_reserve_stock_event,
+    ),
+    transitions={
+        utils.StockIntegrationEvent.STOCK_ALLOCATED: SagaTransition(
+            status="running",
+            step="PAYMENT_PHASE",
+            dispatch=SagaDispatch(
+                topic="payment.request",
+                build_event=_build_start_payment_event,
+            ),
+            apply=_record_stock_reserved,
+        ),
+        utils.StockIntegrationEvent.STOCK_UNAVAILABLE: SagaTransition(
+            status="failed",
+            step="STOCK_RESERVATION_PHASE",
+            apply=_record_stock_unavailable,
+            error="stock_unavailable",
+        ),
+        utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED: SagaTransition(
+            status="completed",
+            step="PAYMENT_PHASE",
+            apply=_record_payment_success,
+        ),
+        utils.PaymentIntegrationEvent.PAYMENT_FAILED: SagaTransition(
+            status="compensating",
+            step="STOCK_RESERVATION_PHASE",
+            dispatch=SagaDispatch(
+                topic="stock.request",
+                build_event=_build_free_stock_event,
+            ),
+            apply=_record_payment_failure,
+        ),
+        utils.StockIntegrationEvent.STOCK_FREED: SagaTransition(
+            status="compensated",
+            step="STOCK_RESERVATION_PHASE",
+            apply=_record_compensation_success,
+            error=lambda results, saga, event: results.get("payment", {}).get("reason", "payment_failed"),
+        ),
+    },
+    result_topic="checkout-results",
+)
+
+
+async def start_checkout(
+    cur,
+    order_id: str,
+    user_id: str,
+    items: list[tuple[str, int]],
+    correlation_id: str | None = None,
+) -> tuple[str, bool]:
+    """Start checkout by handing the generic orchestrator the concrete step inputs."""
+
+    return await ORCHESTRATOR.start_saga(
+        cur,
+        definition=CHECKOUT_SAGA_DEFINITION,
+        saga_data={"order_id": order_id, "user_id": user_id, "items": items},
+        correlation_id=correlation_id,
+    )
 
 
 async def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
-    correlation_id = utils.event_correlation_id(event)
-    await cur.execute(
-        """
-        SELECT id, order_id, status, step, results
-        FROM sagas
-        WHERE id = %s
-        """,
-        (correlation_id,),
-    )
-    saga = await cur.fetchone()
-    if saga is None:
-        return {"handled": False, "reason": "saga_not_found"}
-
-    status = saga["status"]
-    results = _load_results(saga)
-    results.setdefault("transitions", [])
-
-    if status in FINAL_STATUSES:
-        return {"handled": False, "reason": "saga_already_final"}
-
-    if event.event_type == utils.StockIntegrationEvent.STOCK_ALLOCATED:
-        amount = int(getattr(event.payload, "amount", 0))
-        snapshot = results.get("order_snapshot", {})
-        order_id = snapshot.get("order_id", saga["order_id"])
-        user_id = snapshot.get("user_id", "")
-
-        topic = "payment.request"
-        payment_event = utils.start_payment_command_event(
-            correlation_id=correlation_id,
-            order_id=order_id,
-            user_id=user_id,
-            amount=amount,
-        )
-
-        results["stock"] = {"status": "success", "amount": amount}
-        results["transitions"].append({"event_type": event.event_type, "status": "success"})
-        await _upsert_saga(
-            cur,
-            saga_id=correlation_id,
-            order_id=saga["order_id"],
-            status="running",
-            step="PAYMENT_PHASE",
-            results=results,
-        )
-        await _insert_outbox_event(cur, topic, payment_event)
-        return {"handled": True, "status": "running"}
-
-    if event.event_type == utils.StockIntegrationEvent.STOCK_UNAVAILABLE:
-        results["stock"] = {"status": "failed", "reason": "stock_unavailable"}
-        results["transitions"].append({"event_type": event.event_type, "status": "failed"})
-        await _upsert_saga(
-            cur,
-            saga_id=correlation_id,
-            order_id=saga["order_id"],
-            status="failed",
-            step=saga["step"],
-            results=results,
-        )
-        await _emit_checkout_terminal_result_once(
-            cur,
-            correlation_id=correlation_id,
-            order_id=saga["order_id"],
-            status="failed",
-            results=results,
-            error="stock_unavailable",
-        )
-        return {"handled": True, "status": "failed"}
-
-    if event.event_type == utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED:
-        results["payment"] = {"status": "success"}
-        results["transitions"].append({"event_type": event.event_type, "status": "success"})
-        await cur.execute(
-            "UPDATE orders SET paid = TRUE WHERE order_id = %s",
-            (saga["order_id"],),
-        )
-        await _upsert_saga(
-            cur,
-            saga_id=correlation_id,
-            order_id=saga["order_id"],
-            status="completed",
-            step=saga["step"],
-            results=results,
-        )
-        await _emit_checkout_terminal_result_once(
-            cur,
-            correlation_id=correlation_id,
-            order_id=saga["order_id"],
-            status="completed",
-            results=results,
-        )
-        return {"handled": True, "status": "completed"}
-
-    if event.event_type == utils.PaymentIntegrationEvent.PAYMENT_FAILED:
-        snapshot = results.get("order_snapshot", {})
-        raw_items = snapshot.get("items", [])
-        items: list[tuple[str, int]] = [(item[0], int(item[1])) for item in raw_items]
-
-        topic = "stock.request"
-        rollback_event = utils.free_stock_command_event(
-            correlation_id=correlation_id,
-            order_id=saga["order_id"],
-            items=items,
-        )
-        reason = getattr(event.payload, "reason", "payment_failed")
-
-        results["payment"] = {"status": "failed", "reason": reason}
-        results["transitions"].append({"event_type": event.event_type, "status": "failed"})
-        await _upsert_saga(
-            cur,
-            saga_id=correlation_id,
-            order_id=saga["order_id"],
-            status="compensating",
-            step="STOCK_RESERVATION_PHASE",
-            results=results,
-        )
-        await _insert_outbox_event(cur, topic, rollback_event)
-        return {"handled": True, "status": "compensating"}
-
-    if event.event_type == utils.StockIntegrationEvent.STOCK_FREED:
-        results["compensation"] = {"status": "success"}
-        results["transitions"].append({"event_type": event.event_type, "status": "compensated"})
-        await _upsert_saga(
-            cur,
-            saga_id=correlation_id,
-            order_id=saga["order_id"],
-            status="compensated",
-            step=saga["step"],
-            results=results,
-        )
-        await _emit_checkout_terminal_result_once(
-            cur,
-            correlation_id=correlation_id,
-            order_id=saga["order_id"],
-            status="compensated",
-            results=results,
-            error=results.get("payment", {}).get("reason", "payment_failed"),
-        )
-        return {"handled": True, "status": "compensated"}
-
-    return {"handled": False, "reason": "unsupported_event_type"}
+    return await ORCHESTRATOR.apply_event(cur, event, definition=CHECKOUT_SAGA_DEFINITION)
