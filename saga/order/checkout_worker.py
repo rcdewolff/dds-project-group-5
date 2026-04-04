@@ -10,8 +10,8 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any
 
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from fastapi import FastAPI, HTTPException, Request
-from kafka import KafkaConsumer, KafkaProducer
 
 
 CHECKOUT_MAX_INFLIGHT = int(os.getenv("CHECKOUT_MAX_INFLIGHT", "600"))
@@ -27,19 +27,20 @@ logger = logging.getLogger("checkout-worker")
 
 @dataclass(slots=True)
 class WorkerState:
-    producer: KafkaProducer
-    consumer: KafkaConsumer
+    producer: AIOKafkaProducer
+    consumer: AIOKafkaConsumer
     consumer_task: asyncio.Task[None]
     stop_event: asyncio.Event
     waiters: dict[str, asyncio.Future[dict[str, Any]]] = field(default_factory=dict)
     waiters_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    inflight_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(CHECKOUT_MAX_INFLIGHT))
+    inflight_semaphore: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(CHECKOUT_MAX_INFLIGHT)
+    )
     inflight_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     inflight_count: int = 0
 
 
 def _map_final_status(status_payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    """Map terminal saga status to HTTP response."""
     status = status_payload.get("status")
     body = {
         "status": "success" if status == "completed" else "failed",
@@ -51,31 +52,12 @@ def _map_final_status(status_payload: dict[str, Any]) -> tuple[int, dict[str, An
     if status == "completed":
         body["message"] = "Checkout completed successfully."
         return 200, body
-    # failed or compensated
     body["message"] = "Checkout failed."
     return 400, body
 
 
 def _worker_group_id() -> str:
     return f"{CHECKOUT_WORKER_GROUP_ID}-{socket.gethostname()}-{os.getpid()}"
-
-
-def _build_consumer() -> KafkaConsumer:
-    return KafkaConsumer(
-        CHECKOUT_RESULTS_TOPIC,
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id=_worker_group_id(),
-        auto_offset_reset="latest",
-        enable_auto_commit=True,
-        consumer_timeout_ms=1000,
-    )
-
-
-def _build_producer() -> KafkaProducer:
-    return KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        value_serializer=lambda value: json.dumps(value).encode("utf-8"),
-    )
 
 
 def _decode_checkout_result(raw_value: bytes | str | dict[str, Any]) -> dict[str, Any] | None:
@@ -113,7 +95,9 @@ def _decode_checkout_result(raw_value: bytes | str | dict[str, Any]) -> dict[str
     }
 
 
-async def _register_waiter(state: WorkerState, correlation_id: str) -> asyncio.Future[dict[str, Any]]:
+async def _register_waiter(
+    state: WorkerState, correlation_id: str
+) -> asyncio.Future[dict[str, Any]]:
     loop = asyncio.get_running_loop()
     waiter: asyncio.Future[dict[str, Any]] = loop.create_future()
     async with state.waiters_lock:
@@ -121,15 +105,14 @@ async def _register_waiter(state: WorkerState, correlation_id: str) -> asyncio.F
     return waiter
 
 
-async def _remove_waiter(
-    state: WorkerState,
-    correlation_id: str,
-) -> None:
+async def _remove_waiter(state: WorkerState, correlation_id: str) -> None:
     async with state.waiters_lock:
         state.waiters.pop(correlation_id, None)
 
 
-async def _publish_checkout_command(state: WorkerState, *, correlation_id: str, order_id: str) -> None:
+async def _publish_checkout_command(
+    state: WorkerState, *, correlation_id: str, order_id: str
+) -> None:
     command_event = {
         "id": str(uuid.uuid4()),
         "event_type": "checkout.command",
@@ -137,20 +120,17 @@ async def _publish_checkout_command(state: WorkerState, *, correlation_id: str, 
         "order_id": order_id,
         "timestamp": time.time(),
     }
-
-    send_future = await asyncio.to_thread(
-        state.producer.send,
+    await state.producer.send_and_wait(
         CHECKOUT_COMMANDS_TOPIC,
         key=correlation_id.encode("utf-8"),
-        value=command_event,
+        value=json.dumps(command_event).encode("utf-8"),
     )
-    await asyncio.to_thread(send_future.get, 10)
 
 
 async def _consume_checkout_results(state: WorkerState) -> None:
     while not state.stop_event.is_set():
         try:
-            records = await asyncio.to_thread(state.consumer.poll, timeout_ms=1000, max_records=200)
+            records = await state.consumer.getmany(timeout_ms=100, max_records=500)
             if not records:
                 continue
 
@@ -175,6 +155,8 @@ async def _consume_checkout_results(state: WorkerState) -> None:
 
                     if waiter and not waiter.done():
                         waiter.set_result(decoded)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("checkout_result_consumer_loop_error")
             await asyncio.sleep(0.5)
@@ -192,8 +174,18 @@ async def _cancel_all_waiters(state: WorkerState, reason: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    producer = _build_producer()
-    consumer = _build_consumer()
+    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+    consumer = AIOKafkaConsumer(
+        CHECKOUT_RESULTS_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        group_id=_worker_group_id(),
+        auto_offset_reset="latest",
+        enable_auto_commit=True,
+        fetch_max_wait_ms=10,
+    )
+    await producer.start()
+    await consumer.start()
+
     stop_event = asyncio.Event()
     state = WorkerState(
         producer=producer,
@@ -207,7 +199,7 @@ async def lifespan(app: FastAPI):
         "checkout_worker_started command_topic=%s result_topic=%s group_id=%s max_inflight=%s",
         CHECKOUT_COMMANDS_TOPIC,
         CHECKOUT_RESULTS_TOPIC,
-        consumer.config.get("group_id"),
+        _worker_group_id(),
         CHECKOUT_MAX_INFLIGHT,
     )
     try:
@@ -220,9 +212,8 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         await _cancel_all_waiters(state, "worker shutdown")
-        await asyncio.to_thread(producer.flush, 5)
-        await asyncio.to_thread(producer.close)
-        await asyncio.to_thread(consumer.close)
+        await producer.stop()
+        await consumer.stop()
 
 
 app = FastAPI(title="order-checkout-worker", lifespan=lifespan)
@@ -248,16 +239,24 @@ async def checkout(order_id: str, request: Request):
         state.inflight_count += 1
 
     try:
-        # Register waiter before publish to avoid command/result race windows.
         waiter = await _register_waiter(state, correlation_id)
         try:
             try:
-                await _publish_checkout_command(state, correlation_id=correlation_id, order_id=order_id)
+                await _publish_checkout_command(
+                    state, correlation_id=correlation_id, order_id=order_id
+                )
             except Exception as exc:
-                logger.exception("checkout_command_publish_failed order_id=%s correlation_id=%s", order_id, correlation_id)
+                logger.exception(
+                    "checkout_command_publish_failed order_id=%s correlation_id=%s",
+                    order_id, correlation_id,
+                )
                 raise HTTPException(
                     status_code=400,
-                    detail={"status": "failed", "message": "Unable to enqueue checkout command.", "error": str(exc)},
+                    detail={
+                        "status": "failed",
+                        "message": "Unable to enqueue checkout command.",
+                        "error": str(exc),
+                    },
                 )
 
             status_payload = await asyncio.shield(waiter)

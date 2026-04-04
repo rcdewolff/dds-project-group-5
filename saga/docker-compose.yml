@@ -35,7 +35,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - PYTHONUNBUFFERED=1
-    command: gunicorn -b 0.0.0.0:5000 -w 10 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 4 -k uvicorn.workers.UvicornWorker --timeout 60 --config gunicorn.conf.py app:app
     env_file:
       - env/order_citus.env
       - env/kafka_settings.env
@@ -55,7 +55,7 @@ services:
     image: order:latest
     command: uvicorn checkout_worker:app --host 0.0.0.0 --port 8001 --workers 1
     environment:
-      - CHECKOUT_MAX_INFLIGHT=600
+      - CHECKOUT_MAX_INFLIGHT=1000
       - CHECKOUT_COMMANDS_TOPIC=checkout-commands
       - CHECKOUT_RESULTS_TOPIC=checkout-results
       - CHECKOUT_WORKER_GROUP_ID=checkout-worker
@@ -72,7 +72,7 @@ services:
   order-consumer:
     build: ./order
     deploy:
-      replicas: 6
+      replicas: 1
     volumes:
       - ./order:/home/flask-app/
       - ./services:/home/flask-app/services
@@ -80,6 +80,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - INIT_DB=false
+      - DB_POOL_MAX_SIZE=4
     command: python consumer.py
     env_file:
       - env/order_citus.env
@@ -102,7 +103,9 @@ services:
     image: order:latest
     environment:
       - PYTHONUNBUFFERED=1
-      - OUTBOX_POLL_INTERVAL=0.05
+      - OUTBOX_POLL_INTERVAL=0.002
+      - OUTBOX_FETCH_BATCH_SIZE=100
+      - RELAY_WORKERS=2
     command: python producer.py
     env_file:
       - env/order_citus.env
@@ -119,7 +122,12 @@ services:
 
   order-citus-db:
     image: citusdata/citus:13.0
-    command: postgres -c ssl=off
+    command: >
+      postgres
+      -c ssl=off
+      -c max_connections=200
+      -c shared_buffers=512MB
+      -c work_mem=4MB
     environment:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_USER=postgres
@@ -159,7 +167,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 60 --config gunicorn.conf.py app:app
     env_file:
       - env/stock_citus.env
       - env/kafka_settings.env
@@ -174,10 +182,11 @@ services:
   stock-consumer:
     build: ./stock
     deploy:
-      replicas: 6
+      replicas: 1
     environment:
       - PYTHONUNBUFFERED=1
       - INIT_DB=false
+      - DB_POOL_MAX_SIZE=4
     volumes:
       - ./stock:/home/flask-app/
       - ./services:/home/flask-app/services
@@ -204,7 +213,8 @@ services:
     image: stock:latest
     environment:
       - PYTHONUNBUFFERED=1
-      - OUTBOX_POLL_INTERVAL=0.05
+      - OUTBOX_POLL_INTERVAL=0.002
+      - OUTBOX_FETCH_BATCH_SIZE=100
     command: python producer.py
     env_file:
       - env/stock_citus.env
@@ -225,7 +235,12 @@ services:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_USER=postgres
       - POSTGRES_DB=stocks
-    command: postgres -c ssl=off
+    command: >
+      postgres
+      -c ssl=off
+      -c max_connections=100
+      -c shared_buffers=128MB
+      -c work_mem=2MB
     ports:
       - "5433:5432"
     deploy:
@@ -259,7 +274,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
+    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 60 --config gunicorn.conf.py app:app
     environment:
       - PYTHONUNBUFFERED=1
     env_file:
@@ -276,7 +291,7 @@ services:
   payment-consumer:
     build: ./payment
     deploy:
-      replicas: 6
+      replicas: 1
     volumes:
       - ./payment:/home/flask-app/
       - ./services:/home/flask-app/services
@@ -285,6 +300,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - INIT_DB=false
+      - DB_POOL_MAX_SIZE=4
     env_file:
       - env/payment_citus.env
       - env/kafka_settings.env
@@ -307,7 +323,8 @@ services:
     command: python producer.py
     environment:
       - PYTHONUNBUFFERED=1
-      - OUTBOX_POLL_INTERVAL=0.05
+      - OUTBOX_POLL_INTERVAL=0.002
+      - OUTBOX_FETCH_BATCH_SIZE=100
     env_file:
       - env/payment_citus.env
       - env/kafka_settings.env
@@ -326,7 +343,12 @@ services:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_USER=postgres
       - POSTGRES_DB=payments
-    command: postgres -c ssl=off
+    command: >
+      postgres
+      -c ssl=off
+      -c max_connections=100
+      -c shared_buffers=128MB
+      -c work_mem=2MB
     ports:
       - "5434:5432"
     deploy:

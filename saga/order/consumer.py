@@ -1,17 +1,16 @@
+import asyncio
 import json as std_json
 import logging
 import os
-import time
 import uuid
 from typing import Any
 
-import psycopg  # type: ignore
-from msgspec import json
-from psycopg.rows import dict_row  # type: ignore
-from psycopg_pool import ConnectionPool  # type: ignore
+from aiokafka import AIOKafkaConsumer
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from saga_workflow import apply_saga_event, start_checkout
-from services import kafka_client, utils
+from services import utils
 
 
 logging.basicConfig(level=logging.INFO)
@@ -19,57 +18,43 @@ logger = logging.getLogger(__name__)
 
 CHECKOUT_COMMANDS_TOPIC = os.getenv("CHECKOUT_COMMANDS_TOPIC", "checkout-commands")
 CHECKOUT_RESULTS_TOPIC = os.getenv("CHECKOUT_RESULTS_TOPIC", "checkout-results")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
 
-def init_db_pool() -> ConnectionPool:
-    conninfo = (
+def _conninfo() -> str:
+    return (
         f"host={os.environ['POSTGRES_HOST']} "
         f"port={os.environ['POSTGRES_PORT']} "
         f"user={os.environ['POSTGRES_USER']} "
         f"password={os.environ['POSTGRES_PASSWORD']} "
         f"dbname={os.environ['POSTGRES_DB']}"
     )
-    return ConnectionPool(
-        conninfo=conninfo,
-        min_size=1,
-        max_size=5,
-        reconnect_timeout=30,
-        kwargs={"connect_timeout": 10},
-    )
 
 
-def _cleanup_inbox(db_pool: ConnectionPool) -> None:
-    """Delete old processed inbox rows to prevent table bloat."""
+async def _cleanup_inbox(pool: AsyncConnectionPool) -> None:
     try:
-        with db_pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
                     """
                     DELETE FROM inbox
                     WHERE status = 'PROCESSED'
                     AND processed_at < now() - interval '1 minutes'
                     """
                 )
-            conn.commit()
+            await conn.commit()
             logger.debug("Inbox cleanup completed")
     except Exception as exc:
         logger.warning("Inbox cleanup failed: %s", exc)
 
 
-def _mark_inbox_received(cur, message, event: utils.BaseEvent) -> bool:
+async def _mark_inbox_received(cur, message, event: utils.BaseEvent) -> bool:
     raw_payload = message.value.decode() if isinstance(message.value, bytes) else str(message.value)
-    cur.execute(
+    await cur.execute(
         """
         INSERT INTO inbox (
-            id,
-            event_id,
-            topic,
-            partition,
-            kafka_offset,
-            correlation_id,
-            status,
-            payload_hash,
-            payload
+            id, event_id, topic, partition, kafka_offset,
+            correlation_id, status, payload_hash, payload
         )
         VALUES (%s, %s, %s, %s, %s, %s, 'RECEIVED', %s, %s::jsonb)
         ON CONFLICT (event_id) DO NOTHING
@@ -86,11 +71,11 @@ def _mark_inbox_received(cur, message, event: utils.BaseEvent) -> bool:
             raw_payload,
         ),
     )
-    return cur.fetchone() is not None
+    return await cur.fetchone() is not None
 
 
-def _mark_inbox_processed(cur, event: utils.BaseEvent, status: str, error: str | None = None):
-    cur.execute(
+async def _mark_inbox_processed(cur, event: utils.BaseEvent, status: str, error: str | None = None) -> None:
+    await cur.execute(
         """
         UPDATE inbox
         SET status = %s,
@@ -133,25 +118,7 @@ def _decode_checkout_command(message) -> dict[str, Any] | None:
     }
 
 
-def _get_order_snapshot(cur, order_id: str) -> tuple[str, list[tuple[str, int]]] | None:
-    cur.execute(
-        """
-        SELECT user_id, items
-        FROM orders
-        WHERE order_id = %s
-        """,
-        (order_id,),
-    )
-    row = cur.fetchone()
-    if row is None:
-        return None
-
-    raw_items = row.get("items") or []
-    items = [(item["item_id"], int(item["quantity"])) for item in raw_items]
-    return row["user_id"], items
-
-
-def _emit_checkout_terminal_result(
+async def _emit_checkout_terminal_result(
     cur,
     *,
     correlation_id: str,
@@ -160,6 +127,9 @@ def _emit_checkout_terminal_result(
     results: dict[str, Any] | None = None,
     error: str | None = None,
 ) -> None:
+    from msgspec import json
+    import time
+
     event_payload = {
         "event_type": "checkout.result",
         "correlation_id": correlation_id,
@@ -178,18 +148,11 @@ def _emit_checkout_terminal_result(
     )
     payload_text = json.encode(event).decode()
 
-    cur.execute(
+    await cur.execute(
         """
         INSERT INTO outbox (
-            id,
-            event_id,
-            topic,
-            message_key,
-            correlation_id,
-            payload,
-            status,
-            publish_attempts,
-            created_at
+            id, event_id, topic, message_key, correlation_id,
+            payload, status, publish_attempts, created_at
         )
         VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'PENDING', 0, now())
         ON CONFLICT (event_id) DO NOTHING
@@ -205,194 +168,184 @@ def _emit_checkout_terminal_result(
     )
 
 
-def _handle_checkout_command(cur, command: dict[str, Any]) -> dict[str, Any]:
-    event_type = command.get("event_type")
+async def _process_checkout_command(message, pool: AsyncConnectionPool) -> None:
+    try:
+        command = _decode_checkout_command(message)
+    except Exception as exc:
+        logger.error("Checkout command decode failed topic=%s error=%s", message.topic, exc)
+        return
+
+    if not command:
+        logger.error("Checkout command dropped: invalid payload")
+        return
+
     correlation_id = command.get("correlation_id")
     order_id = command.get("order_id")
 
-    if event_type != "checkout.command":
-        return {"handled": False, "reason": "unsupported_command_event"}
+    if command.get("event_type") != "checkout.command" or not correlation_id or not order_id:
+        logger.error("Checkout command invalid correlation_id=%s order_id=%s", correlation_id, order_id)
+        return
 
-    if not correlation_id or not order_id:
-        return {"handled": False, "reason": "invalid_command"}
-
-    snapshot = _get_order_snapshot(cur, order_id)
-    if snapshot is None:
-        _emit_checkout_terminal_result(
-            cur,
-            correlation_id=correlation_id,
-            order_id=order_id,
-            status="failed",
-            error="order_not_found",
-            results={"reason": "order_not_found"},
-        )
-        return {"handled": True, "status": "failed", "reason": "order_not_found"}
-
-    user_id, items = snapshot
-    if not items:
-        _emit_checkout_terminal_result(
-            cur,
-            correlation_id=correlation_id,
-            order_id=order_id,
-            status="failed",
-            error="order_has_no_items",
-            results={"reason": "order_has_no_items"},
-        )
-        return {"handled": True, "status": "failed", "reason": "order_has_no_items"}
-
-    started_correlation_id, created = start_checkout(
-        cur,
-        order_id=order_id,
-        user_id=user_id,
-        items=items,
-        correlation_id=correlation_id,
-    )
-
-    if started_correlation_id != correlation_id:
-        _emit_checkout_terminal_result(
-            cur,
-            correlation_id=correlation_id,
-            order_id=order_id,
-            status="failed",
-            error="checkout_already_in_progress",
-            results={"active_correlation_id": started_correlation_id},
-        )
-        return {"handled": True, "status": "failed", "reason": "checkout_already_in_progress"}
-
-    return {
-        "handled": True,
-        "status": "running",
-        "created": created,
-        "correlation_id": started_correlation_id,
-        "order_id": order_id,
-    }
-
-
-def main():
-    logger.info("Starting order consumer with durable inbox processing")
-    service_name = "order"
-    client = kafka_client.Client(service_name, [f"{service_name}.request", CHECKOUT_COMMANDS_TOPIC])
-    consumer = client.consumer
-    db_pool = init_db_pool()
-    message_count = 0
-
-    for message in consumer:
-        message_count += 1
-        if message_count % 100 == 0:
-            _cleanup_inbox(db_pool)
-
-        if message.topic == CHECKOUT_COMMANDS_TOPIC:
-            try:
-                command = _decode_checkout_command(message)
-            except Exception as exc:
-                logger.error("Checkout command decode failed topic=%s error=%s", message.topic, exc)
-                continue
-
-            if not command:
-                logger.error("Checkout command dropped: invalid payload")
-                continue
-
-            correlation_id = command.get("correlation_id")
-            order_id = command.get("order_id")
-            logger.info(
-                "Checkout command received correlation_id=%s order_id=%s topic=%s partition=%s offset=%s",
-                correlation_id,
-                order_id,
-                message.topic,
-                message.partition,
-                message.offset,
-            )
-
-            try:
-                with db_pool.connection() as conn:
-                    with conn.cursor(row_factory=dict_row) as cur:
-                        outcome = _handle_checkout_command(cur, command)
-                        conn.commit()
-                logger.info(
-                    "Checkout command handled correlation_id=%s order_id=%s outcome=%s",
-                    correlation_id,
-                    order_id,
-                    std_json.dumps(outcome),
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # Fetch order snapshot
+                await cur.execute(
+                    "SELECT user_id, items FROM orders WHERE order_id = %s",
+                    (order_id,),
                 )
-            except psycopg.Error as exc:
-                logger.exception(
-                    "Checkout command DB failure correlation_id=%s order_id=%s error=%s",
-                    correlation_id,
-                    order_id,
-                    exc,
-                )
-                if correlation_id and order_id:
-                    try:
-                        with db_pool.connection() as conn:
-                            with conn.cursor(row_factory=dict_row) as cur:
-                                _emit_checkout_terminal_result(
-                                    cur,
-                                    correlation_id=correlation_id,
-                                    order_id=order_id,
-                                    status="failed",
-                                    error="internal_db_error",
-                                    results={"reason": "internal_db_error"},
-                                )
-                                conn.commit()
-                    except Exception:
-                        logger.exception(
-                            "Failed to emit checkout terminal failure for correlation_id=%s",
-                            correlation_id,
-                        )
-            continue
+                row = await cur.fetchone()
 
-        result = utils.decode_and_type_event(message)
-        if isinstance(result, utils.Failure):
-            logger.error("Kafka message dropped: %s", result.error)
-            continue
-
-        event = result.value
-        correlation_id = utils.event_correlation_id(event)
-        logger.info(
-            "Order consumer received event_id=%s correlation_id=%s topic=%s partition=%s offset=%s",
-            event.id,
-            correlation_id,
-            message.topic,
-            message.partition,
-            message.offset,
-        )
-
-        try:
-            with db_pool.connection() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    inbox_inserted = _mark_inbox_received(cur, message, event)
-                    if not inbox_inserted:
-                        logger.info(
-                            "Order inbox dedupe hit event_id=%s correlation_id=%s",
-                            event.id,
-                            correlation_id,
-                        )
-                        conn.commit()
-                        continue
-                    outcome = apply_saga_event(cur, event)
-                    _mark_inbox_processed(cur, event, status="PROCESSED")
-                    conn.commit()
-                    logger.info(
-                        "Order event handled event_id=%s correlation_id=%s outcome=%s",
-                        event.id,
-                        correlation_id,
-                        std_json.dumps(outcome),
+                if row is None:
+                    await _emit_checkout_terminal_result(
+                        cur,
+                        correlation_id=correlation_id,
+                        order_id=order_id,
+                        status="failed",
+                        error="order_not_found",
+                        results={"reason": "order_not_found"},
                     )
-        except psycopg.Error as exc:
-            logger.exception(
-                "Order consumer DB failure event_id=%s correlation_id=%s error=%s",
-                event.id,
-                correlation_id,
-                exc,
-            )
-            try:
-                with db_pool.connection() as conn:
-                    with conn.cursor() as cur:
-                        _mark_inbox_processed(cur, event, status="FAILED", error=str(exc))
-                        conn.commit()
-            except Exception:
-                logger.exception("Failed to update inbox error state for event_id=%s", event.id)
+                    await conn.commit()
+                    return
+
+                raw_items = row.get("items") or []
+                items = [(item["item_id"], int(item["quantity"])) for item in raw_items]
+                user_id = row["user_id"]
+
+                if not items:
+                    await _emit_checkout_terminal_result(
+                        cur,
+                        correlation_id=correlation_id,
+                        order_id=order_id,
+                        status="failed",
+                        error="order_has_no_items",
+                        results={"reason": "order_has_no_items"},
+                    )
+                    await conn.commit()
+                    return
+
+                started_correlation_id, created = await start_checkout(
+                    cur,
+                    order_id=order_id,
+                    user_id=user_id,
+                    items=items,
+                    correlation_id=correlation_id,
+                )
+
+                if started_correlation_id != correlation_id:
+                    await _emit_checkout_terminal_result(
+                        cur,
+                        correlation_id=correlation_id,
+                        order_id=order_id,
+                        status="failed",
+                        error="checkout_already_in_progress",
+                        results={"active_correlation_id": started_correlation_id},
+                    )
+
+                await conn.commit()
+                logger.info(
+                    "Checkout command handled correlation_id=%s order_id=%s created=%s",
+                    correlation_id, order_id, created,
+                )
+    except Exception as exc:
+        logger.exception(
+            "Checkout command DB failure correlation_id=%s order_id=%s error=%s",
+            correlation_id, order_id, exc,
+        )
+
+
+async def _process_order_event(message, pool: AsyncConnectionPool) -> None:
+    result = utils.decode_and_type_event(message)
+    if isinstance(result, utils.Failure):
+        logger.error("Kafka message dropped: %s", result.error)
+        return
+
+    event = result.value
+    correlation_id = utils.event_correlation_id(event)
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                inbox_inserted = await _mark_inbox_received(cur, message, event)
+                if not inbox_inserted:
+                    logger.info(
+                        "Order inbox dedupe hit event_id=%s correlation_id=%s",
+                        event.id, correlation_id,
+                    )
+                    await conn.commit()
+                    return
+
+                outcome = await apply_saga_event(cur, event)
+                await _mark_inbox_processed(cur, event, status="PROCESSED")
+                await conn.commit()
+                logger.info(
+                    "Order event handled event_id=%s correlation_id=%s outcome=%s",
+                    event.id, correlation_id, std_json.dumps(outcome),
+                )
+    except Exception as exc:
+        logger.exception(
+            "Order consumer DB failure event_id=%s correlation_id=%s error=%s",
+            event.id, correlation_id, exc,
+        )
+        try:
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await _mark_inbox_processed(cur, event, status="FAILED", error=str(exc))
+                    await conn.commit()
+        except Exception:
+            logger.exception("Failed to update inbox error state for event_id=%s", event.id)
+
+
+async def _process_message(message, pool: AsyncConnectionPool) -> None:
+    if message.topic == CHECKOUT_COMMANDS_TOPIC:
+        await _process_checkout_command(message, pool)
+    else:
+        await _process_order_event(message, pool)
+
+
+async def _cleanup_loop(pool: AsyncConnectionPool) -> None:
+    while True:
+        await asyncio.sleep(30)
+        await _cleanup_inbox(pool)
+
+
+async def main() -> None:
+    pool_size = int(os.getenv("DB_POOL_MAX_SIZE", "4"))
+    logger.info("Order consumer starting pool_size=%s", pool_size)
+
+    async with AsyncConnectionPool(conninfo=_conninfo(), min_size=1, max_size=pool_size) as pool:
+        consumer = AIOKafkaConsumer(
+            "order.request",
+            CHECKOUT_COMMANDS_TOPIC,
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            group_id="order-consumer-group",
+            auto_offset_reset="earliest",
+            enable_auto_commit=True,
+            fetch_max_wait_ms=10,
+            max_poll_records=500,
+        )
+        await consumer.start()
+        logger.info("Order consumer started topics=order.request,%s", CHECKOUT_COMMANDS_TOPIC)
+
+        cleanup_task = asyncio.create_task(_cleanup_loop(pool))
+        try:
+            while True:
+                records = await consumer.getmany(timeout_ms=100, max_records=pool_size * 2)
+                if not records:
+                    continue
+                tasks = [
+                    asyncio.create_task(_process_message(msg, pool))
+                    for msgs in records.values()
+                    for msg in msgs
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        logger.exception("Order consumer task failed: %s", r)
+        finally:
+            cleanup_task.cancel()
+            await consumer.stop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

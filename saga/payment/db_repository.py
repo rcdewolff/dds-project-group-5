@@ -16,8 +16,8 @@ class PaymentRepository:
             return std_json.dumps(payload)
         return msgspec_json.encode(payload).decode("utf-8")
 
-    def create_tables(self) -> None:
-        self.cur.execute(
+    async def create_tables(self) -> None:
+        await self.cur.execute(
             """
             CREATE TABLE IF NOT EXISTS accounts (
                 user_id TEXT PRIMARY KEY,
@@ -28,7 +28,7 @@ class PaymentRepository:
             )
             """
         )
-        self.cur.execute(
+        await self.cur.execute(
             """
             CREATE TABLE IF NOT EXISTS inbox (
                 id TEXT PRIMARY KEY,
@@ -47,9 +47,9 @@ class PaymentRepository:
             )
             """
         )
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_inbox_correlation ON inbox(correlation_id)")
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_inbox_status ON inbox(status, received_at)")
-        self.cur.execute(
+        await self.cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_inbox_correlation ON inbox(correlation_id)")
+        await self.cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_inbox_status ON inbox(status, received_at)")
+        await self.cur.execute(
             """
             CREATE TABLE IF NOT EXISTS outbox (
                 id TEXT PRIMARY KEY,
@@ -67,40 +67,40 @@ class PaymentRepository:
             )
             """
         )
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS event_id TEXT")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS message_key TEXT")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS correlation_id TEXT")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS headers JSONB")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS publish_attempts INTEGER DEFAULT 0")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS last_error TEXT")
-        self.cur.execute("UPDATE outbox SET status='PENDING' WHERE status IS NULL")
-        self.cur.execute("UPDATE outbox SET event_id = id WHERE event_id IS NULL")
-        self.cur.execute("UPDATE outbox SET correlation_id = COALESCE(correlation_id, '')")
-        self.cur.execute("UPDATE outbox SET message_key = COALESCE(message_key, correlation_id, '')")
-        self.cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_outbox_event_id ON outbox(event_id)")
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_outbox_status ON outbox(status, created_at)")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS event_id TEXT")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS message_key TEXT")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS correlation_id TEXT")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS headers JSONB")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS publish_attempts INTEGER DEFAULT 0")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS last_error TEXT")
+        await self.cur.execute("UPDATE outbox SET status='PENDING' WHERE status IS NULL")
+        await self.cur.execute("UPDATE outbox SET event_id = id WHERE event_id IS NULL")
+        await self.cur.execute("UPDATE outbox SET correlation_id = COALESCE(correlation_id, '')")
+        await self.cur.execute("UPDATE outbox SET message_key = COALESCE(message_key, correlation_id, '')")
+        await self.cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_outbox_event_id ON outbox(event_id)")
+        await self.cur.execute("CREATE INDEX IF NOT EXISTS idx_payment_outbox_status ON outbox(status, created_at)")
 
-    def get_account(self, user_id: str) -> dict[str, Any] | None:
-        self.cur.execute(
+    async def get_account(self, user_id: str) -> dict[str, Any] | None:
+        await self.cur.execute(
             "SELECT user_id, credit, version FROM accounts WHERE user_id = %s",
             (user_id,),
         )
-        return self.cur.fetchone()
+        return await self.cur.fetchone()
 
-    def list_accounts(self) -> list[dict[str, Any]]:
-        self.cur.execute("SELECT user_id, credit FROM accounts")
-        return self.cur.fetchall()
+    async def list_accounts(self) -> list[dict[str, Any]]:
+        await self.cur.execute("SELECT user_id, credit FROM accounts")
+        return await self.cur.fetchall()
 
-    def insert_account(self, user_id: str, credit: int, version: int = 1) -> None:
-        self.cur.execute(
+    async def insert_account(self, user_id: str, credit: int, version: int = 1) -> None:
+        await self.cur.execute(
             "INSERT INTO accounts (user_id, credit, version) VALUES (%s, %s, %s)",
             (user_id, credit, version),
         )
 
-    def upsert_account(self, user_id: str, credit: int, version: int = 1) -> None:
-        self.cur.execute(
+    async def upsert_account(self, user_id: str, credit: int, version: int = 1) -> None:
+        await self.cur.execute(
             """
             INSERT INTO accounts (user_id, credit, version)
             VALUES (%s, %s, %s)
@@ -112,8 +112,10 @@ class PaymentRepository:
             (user_id, credit, version),
         )
 
-    def update_account_versioned(self, user_id: str, credit: int, new_version: int, current_version: int) -> bool:
-        self.cur.execute(
+    async def update_account_versioned(
+        self, user_id: str, credit: int, new_version: int, current_version: int
+    ) -> bool:
+        await self.cur.execute(
             """UPDATE accounts
                SET credit = %s,
                    version = %s,
@@ -123,14 +125,14 @@ class PaymentRepository:
         )
         return self.cur.rowcount > 0
 
-    def inbox_event_exists(self, event_id: str) -> bool:
-        self.cur.execute(
+    async def inbox_event_exists(self, event_id: str) -> bool:
+        await self.cur.execute(
             "SELECT event_id FROM inbox WHERE event_id = %s AND status = 'PROCESSED'",
             (event_id,),
         )
-        return self.cur.fetchone() is not None
+        return await self.cur.fetchone() is not None
 
-    def insert_inbox_event(
+    async def insert_inbox_event(
         self,
         event_id: str,
         topic: str,
@@ -140,7 +142,7 @@ class PaymentRepository:
         payload: Any,
         payload_hash: str,
     ) -> None:
-        self.cur.execute(
+        await self.cur.execute(
             """
             INSERT INTO inbox (id, event_id, topic, partition, kafka_offset, correlation_id, payload, payload_hash)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -158,15 +160,17 @@ class PaymentRepository:
             ),
         )
 
-    def get_inbox_event_result(self, event_id: str) -> dict[str, Any] | None:
-        self.cur.execute("SELECT result FROM inbox WHERE event_id = %s", (event_id,))
-        row = self.cur.fetchone()
+    async def get_inbox_event_result(self, event_id: str) -> dict[str, Any] | None:
+        await self.cur.execute("SELECT result FROM inbox WHERE event_id = %s", (event_id,))
+        row = await self.cur.fetchone()
         if row is None:
             return None
         return row["result"]
 
-    def set_inbox_event_result(self, event_id: str, status: str, result: dict[str, Any], error: str | None = None) -> None:
-        self.cur.execute(
+    async def set_inbox_event_result(
+        self, event_id: str, status: str, result: dict[str, Any], error: str | None = None
+    ) -> None:
+        await self.cur.execute(
             """
             UPDATE inbox
             SET status = %s,
@@ -178,9 +182,11 @@ class PaymentRepository:
             (status, self._to_jsonb(result), error, event_id),
         )
 
-    def insert_outbox_message(self, topic: str, payload: Any, message_key: str, correlation_id: str) -> None:
+    async def insert_outbox_message(
+        self, topic: str, payload: Any, message_key: str, correlation_id: str
+    ) -> None:
         event_id = payload.id if isinstance(payload, utils.BaseEvent) else str(uuid.uuid4())
-        self.cur.execute(
+        await self.cur.execute(
             """
             INSERT INTO outbox (id, event_id, topic, message_key, correlation_id, payload)
             VALUES (%s, %s, %s, %s, %s, %s)

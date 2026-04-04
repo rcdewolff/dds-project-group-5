@@ -14,11 +14,10 @@ class StockRepository:
     def _to_jsonb(payload: Any) -> str:
         if isinstance(payload, dict):
             return std_json.dumps(payload)
-        # Supports msgspec Structs like utils.BaseEvent
         return msgspec_json.encode(payload).decode("utf-8")
 
-    def create_tables(self) -> None:
-        self.cur.execute(
+    async def create_tables(self) -> None:
+        await self.cur.execute(
             """
             CREATE TABLE IF NOT EXISTS inventory (
                 item_id TEXT PRIMARY KEY,
@@ -30,7 +29,7 @@ class StockRepository:
             )
             """
         )
-        self.cur.execute(
+        await self.cur.execute(
             """
             CREATE TABLE IF NOT EXISTS inbox (
                 id TEXT PRIMARY KEY,
@@ -49,9 +48,9 @@ class StockRepository:
             )
             """
         )
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_stock_inbox_correlation ON inbox(correlation_id)")
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_stock_inbox_status ON inbox(status, received_at)")
-        self.cur.execute(
+        await self.cur.execute("CREATE INDEX IF NOT EXISTS idx_stock_inbox_correlation ON inbox(correlation_id)")
+        await self.cur.execute("CREATE INDEX IF NOT EXISTS idx_stock_inbox_status ON inbox(status, received_at)")
+        await self.cur.execute(
             """
             CREATE TABLE IF NOT EXISTS outbox (
                 id TEXT PRIMARY KEY,
@@ -69,47 +68,51 @@ class StockRepository:
             )
             """
         )
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS event_id TEXT")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS message_key TEXT")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS correlation_id TEXT")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS headers JSONB")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS publish_attempts INTEGER DEFAULT 0")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
-        self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS last_error TEXT")
-        self.cur.execute("UPDATE outbox SET status='PENDING' WHERE status IS NULL")
-        self.cur.execute("UPDATE outbox SET event_id = id WHERE event_id IS NULL")
-        self.cur.execute("UPDATE outbox SET correlation_id = COALESCE(correlation_id, '')")
-        self.cur.execute("UPDATE outbox SET message_key = COALESCE(message_key, correlation_id, '')")
-        self.cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_outbox_event_id ON outbox(event_id)")
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_stock_outbox_status ON outbox(status, created_at)")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS event_id TEXT")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS message_key TEXT")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS correlation_id TEXT")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS headers JSONB")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS publish_attempts INTEGER DEFAULT 0")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
+        await self.cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS last_error TEXT")
+        await self.cur.execute("UPDATE outbox SET status='PENDING' WHERE status IS NULL")
+        await self.cur.execute("UPDATE outbox SET event_id = id WHERE event_id IS NULL")
+        await self.cur.execute("UPDATE outbox SET correlation_id = COALESCE(correlation_id, '')")
+        await self.cur.execute("UPDATE outbox SET message_key = COALESCE(message_key, correlation_id, '')")
+        await self.cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_outbox_event_id ON outbox(event_id)")
+        await self.cur.execute("CREATE INDEX IF NOT EXISTS idx_stock_outbox_status ON outbox(status, created_at)")
 
-    def get_inventory_item(self, item_id: str) -> dict[str, Any] | None:
-        self.cur.execute(
+    async def get_inventory_item(self, item_id: str) -> dict[str, Any] | None:
+        await self.cur.execute(
             "SELECT item_id, stock, price, version FROM inventory WHERE item_id = %s",
             (item_id,),
         )
-        return self.cur.fetchone()
+        return await self.cur.fetchone()
 
-    def list_inventory(self) -> list[dict[str, Any]]:
-        self.cur.execute("SELECT item_id, stock, price FROM inventory")
-        return self.cur.fetchall()
+    async def list_inventory(self) -> list[dict[str, Any]]:
+        await self.cur.execute("SELECT item_id, stock, price FROM inventory")
+        return await self.cur.fetchall()
 
-    def get_inventory_items_for_ids(self, item_ids: list[str], include_price: bool = False) -> dict[str, dict[str, Any]]:
+    async def get_inventory_items_for_ids(
+        self, item_ids: list[str], include_price: bool = False
+    ) -> dict[str, dict[str, Any]]:
         if not item_ids:
             return {}
         placeholders = ",".join(["%s"] * len(item_ids))
         cols = "item_id, stock, version"
         if include_price:
             cols = "item_id, stock, price, version"
-        self.cur.execute(
+        await self.cur.execute(
             f"SELECT {cols} FROM inventory WHERE item_id IN ({placeholders})",
             item_ids,
         )
-        return {row["item_id"]: row for row in self.cur.fetchall()}
+        return {row["item_id"]: row for row in await self.cur.fetchall()}
 
-    def update_inventory_item_versioned(self, item_id: str, new_stock: int, new_version: int, current_version: int) -> bool:
-        self.cur.execute(
+    async def update_inventory_item_versioned(
+        self, item_id: str, new_stock: int, new_version: int, current_version: int
+    ) -> bool:
+        await self.cur.execute(
             """UPDATE inventory
                SET stock = %s,
                    version = %s,
@@ -119,20 +122,22 @@ class StockRepository:
         )
         return self.cur.rowcount > 0
 
-    def insert_inventory_item(self, item_id: str, stock: int, price: int, version: int = 1) -> None:
-        self.cur.execute(
+    async def insert_inventory_item(
+        self, item_id: str, stock: int, price: int, version: int = 1
+    ) -> None:
+        await self.cur.execute(
             "INSERT INTO inventory (item_id, stock, price, version) VALUES (%s, %s, %s, %s)",
             (item_id, stock, price, version),
         )
 
-    def inbox_event_exists(self, event_id: str) -> bool:
-        self.cur.execute(
+    async def inbox_event_exists(self, event_id: str) -> bool:
+        await self.cur.execute(
             "SELECT event_id FROM inbox WHERE event_id = %s AND status = 'PROCESSED'",
             (event_id,),
         )
-        return self.cur.fetchone() is not None
+        return await self.cur.fetchone() is not None
 
-    def insert_inbox_event(
+    async def insert_inbox_event(
         self,
         event_id: str,
         topic: str,
@@ -142,7 +147,7 @@ class StockRepository:
         payload: Any,
         payload_hash: str,
     ) -> None:
-        self.cur.execute(
+        await self.cur.execute(
             """
             INSERT INTO inbox (id, event_id, topic, partition, kafka_offset, correlation_id, payload, payload_hash)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -160,15 +165,17 @@ class StockRepository:
             ),
         )
 
-    def get_inbox_event_result(self, event_id: str) -> dict[str, Any] | None:
-        self.cur.execute("SELECT result FROM inbox WHERE event_id = %s", (event_id,))
-        row = self.cur.fetchone()
+    async def get_inbox_event_result(self, event_id: str) -> dict[str, Any] | None:
+        await self.cur.execute("SELECT result FROM inbox WHERE event_id = %s", (event_id,))
+        row = await self.cur.fetchone()
         if row is None:
             return None
         return row["result"]
 
-    def set_inbox_event_result(self, event_id: str, status: str, result: dict[str, Any], error: str | None = None) -> None:
-        self.cur.execute(
+    async def set_inbox_event_result(
+        self, event_id: str, status: str, result: dict[str, Any], error: str | None = None
+    ) -> None:
+        await self.cur.execute(
             """
             UPDATE inbox
             SET status = %s,
@@ -180,9 +187,9 @@ class StockRepository:
             (status, std_json.dumps(result), error, event_id),
         )
 
-    def insert_outbox_message(self, topic: str, payload: utils.BaseEvent) -> None:
+    async def insert_outbox_message(self, topic: str, payload: utils.BaseEvent) -> None:
         correlation_id = utils.event_correlation_id(payload)
-        self.cur.execute(
+        await self.cur.execute(
             """
             INSERT INTO outbox (id, event_id, topic, message_key, correlation_id, payload)
             VALUES (%s, %s, %s, %s, %s, %s)

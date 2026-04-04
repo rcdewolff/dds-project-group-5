@@ -27,9 +27,9 @@ def _load_results(row: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _insert_outbox_event(cur, topic: str, event: utils.BaseEvent[Any]) -> None:
+async def _insert_outbox_event(cur, topic: str, event: utils.BaseEvent[Any]) -> None:
     payload_text = json.encode(event).decode()
-    cur.execute(
+    await cur.execute(
         """
         INSERT INTO outbox (
             id,
@@ -55,7 +55,7 @@ def _insert_outbox_event(cur, topic: str, event: utils.BaseEvent[Any]) -> None:
     )
 
 
-def _emit_checkout_terminal_result_once(
+async def _emit_checkout_terminal_result_once(
     cur,
     *,
     correlation_id: str,
@@ -82,7 +82,7 @@ def _emit_checkout_terminal_result_once(
     )
     payload_text = json.encode(event).decode()
 
-    cur.execute(
+    await cur.execute(
         """
         INSERT INTO outbox (
             id,
@@ -109,8 +109,10 @@ def _emit_checkout_terminal_result_once(
     )
 
 
-def _upsert_saga(cur, saga_id: str, order_id: str, status: str, step: str, results: dict[str, Any]) -> None:
-    cur.execute(
+async def _upsert_saga(
+    cur, saga_id: str, order_id: str, status: str, step: str, results: dict[str, Any]
+) -> None:
+    await cur.execute(
         """
         INSERT INTO sagas (order_id, id, status, step, results)
         VALUES (%s, %s, %s, %s, %s::jsonb)
@@ -123,7 +125,7 @@ def _upsert_saga(cur, saga_id: str, order_id: str, status: str, step: str, resul
     )
 
 
-def start_checkout(
+async def start_checkout(
     cur,
     order_id: str,
     user_id: str,
@@ -131,19 +133,15 @@ def start_checkout(
     correlation_id: str | None = None,
 ) -> tuple[str, bool]:
     if correlation_id:
-        cur.execute(
-            """
-            SELECT id
-            FROM sagas
-            WHERE id = %s
-            """,
+        await cur.execute(
+            "SELECT id FROM sagas WHERE id = %s",
             (correlation_id,),
         )
-        existing_by_id = cur.fetchone()
+        existing_by_id = await cur.fetchone()
         if existing_by_id:
             return existing_by_id["id"], False
 
-    cur.execute(
+    await cur.execute(
         """
         SELECT id, status
         FROM sagas
@@ -153,7 +151,7 @@ def start_checkout(
         """,
         (order_id,),
     )
-    existing = cur.fetchone()
+    existing = await cur.fetchone()
     if existing and existing["status"] in ACTIVE_STATUSES:
         return existing["id"], False
 
@@ -179,7 +177,7 @@ def start_checkout(
         ],
     }
 
-    _upsert_saga(
+    await _upsert_saga(
         cur,
         saga_id=saga_id,
         order_id=order_id,
@@ -187,13 +185,13 @@ def start_checkout(
         step="STOCK_RESERVATION_PHASE",
         results=results,
     )
-    _insert_outbox_event(cur, topic, event)
+    await _insert_outbox_event(cur, topic, event)
     return saga_id, True
 
 
-def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
+async def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
     correlation_id = utils.event_correlation_id(event)
-    cur.execute(
+    await cur.execute(
         """
         SELECT id, order_id, status, step, results
         FROM sagas
@@ -201,7 +199,7 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
         """,
         (correlation_id,),
     )
-    saga = cur.fetchone()
+    saga = await cur.fetchone()
     if saga is None:
         return {"handled": False, "reason": "saga_not_found"}
 
@@ -228,7 +226,7 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
 
         results["stock"] = {"status": "success", "amount": amount}
         results["transitions"].append({"event_type": event.event_type, "status": "success"})
-        _upsert_saga(
+        await _upsert_saga(
             cur,
             saga_id=correlation_id,
             order_id=saga["order_id"],
@@ -236,13 +234,13 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
             step="PAYMENT_PHASE",
             results=results,
         )
-        _insert_outbox_event(cur, topic, payment_event)
+        await _insert_outbox_event(cur, topic, payment_event)
         return {"handled": True, "status": "running"}
 
     if event.event_type == utils.StockIntegrationEvent.STOCK_UNAVAILABLE:
         results["stock"] = {"status": "failed", "reason": "stock_unavailable"}
         results["transitions"].append({"event_type": event.event_type, "status": "failed"})
-        _upsert_saga(
+        await _upsert_saga(
             cur,
             saga_id=correlation_id,
             order_id=saga["order_id"],
@@ -250,7 +248,7 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
             step=saga["step"],
             results=results,
         )
-        _emit_checkout_terminal_result_once(
+        await _emit_checkout_terminal_result_once(
             cur,
             correlation_id=correlation_id,
             order_id=saga["order_id"],
@@ -263,11 +261,11 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
     if event.event_type == utils.PaymentIntegrationEvent.PAYMENT_SUCCEEDED:
         results["payment"] = {"status": "success"}
         results["transitions"].append({"event_type": event.event_type, "status": "success"})
-        cur.execute(
+        await cur.execute(
             "UPDATE orders SET paid = TRUE WHERE order_id = %s",
             (saga["order_id"],),
         )
-        _upsert_saga(
+        await _upsert_saga(
             cur,
             saga_id=correlation_id,
             order_id=saga["order_id"],
@@ -275,7 +273,7 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
             step=saga["step"],
             results=results,
         )
-        _emit_checkout_terminal_result_once(
+        await _emit_checkout_terminal_result_once(
             cur,
             correlation_id=correlation_id,
             order_id=saga["order_id"],
@@ -299,7 +297,7 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
 
         results["payment"] = {"status": "failed", "reason": reason}
         results["transitions"].append({"event_type": event.event_type, "status": "failed"})
-        _upsert_saga(
+        await _upsert_saga(
             cur,
             saga_id=correlation_id,
             order_id=saga["order_id"],
@@ -307,13 +305,13 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
             step="STOCK_RESERVATION_PHASE",
             results=results,
         )
-        _insert_outbox_event(cur, topic, rollback_event)
+        await _insert_outbox_event(cur, topic, rollback_event)
         return {"handled": True, "status": "compensating"}
 
     if event.event_type == utils.StockIntegrationEvent.STOCK_FREED:
         results["compensation"] = {"status": "success"}
         results["transitions"].append({"event_type": event.event_type, "status": "compensated"})
-        _upsert_saga(
+        await _upsert_saga(
             cur,
             saga_id=correlation_id,
             order_id=saga["order_id"],
@@ -321,7 +319,7 @@ def apply_saga_event(cur, event: utils.BaseEvent[Any]) -> dict[str, Any]:
             step=saga["step"],
             results=results,
         )
-        _emit_checkout_terminal_result_once(
+        await _emit_checkout_terminal_result_once(
             cur,
             correlation_id=correlation_id,
             order_id=saga["order_id"],

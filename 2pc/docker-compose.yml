@@ -1,4 +1,6 @@
 services:
+
+  # ── Gateway ────────────────────────────────────────────────────────────────
   gateway:
     image: nginx:1.25-bookworm
     volumes:
@@ -11,7 +13,7 @@ services:
       - stock-service
       - payment-service
 
-
+  # ── Application services ───────────────────────────────────────────────────
   order-service:
     build: ./order
     volumes:
@@ -21,34 +23,13 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app  
+    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --config gunicorn.conf.py --log-level=info app:app
     env_file:
       - env/order_citus.env
       - env/kafka_settings.env
     depends_on:
-      # kafka:
-      #   condition: service_healthy
-      order-citus-db:
+      db-haproxy:
         condition: service_healthy
-
-  order-citus-db:
-    image: citusdata/citus:13.0
-    command: postgres -c ssl=off
-    environment:
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_USER=postgres
-      - POSTGRES_DB=orders
-    ports:
-      - "5432:5432"
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
 
   stock-service:
     build: ./stock
@@ -61,29 +42,8 @@ services:
       - env/stock_citus.env
       - env/kafka_settings.env
     depends_on:
-      stock-citus-db:
+      db-haproxy:
         condition: service_healthy
-      # kafka:
-      #   condition: service_healthy
-      
-  stock-citus-db:
-    image: citusdata/citus:13.0
-    environment:
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_USER=postgres
-      - POSTGRES_DB=stocks
-    command: postgres -c ssl=off
-    ports:
-      - "5433:5432"
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
 
   payment-service:
     build: ./payment
@@ -96,30 +56,201 @@ services:
       - env/payment_citus.env
       - env/kafka_settings.env
     depends_on:
-      # kafka:
-      #   condition: service_healthy
-      payment-citus-db:
+      db-haproxy:
         condition: service_healthy
 
-
-  payment-citus-db:
-    image: citusdata/citus:13.0
+  # ── Distributed consensus (required by Patroni for leader election) ────────
+  etcd:
+    image: bitnami/etcd:3.5
     environment:
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_USER=postgres
-      - POSTGRES_DB=payments
-    command: postgres -c ssl=off
-    ports:
-      - "5434:5432"
-    deploy:
-      resources:
-        limits:
-          memory: 512M
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    volumes:
+      - etcd_data:/bitnami/etcd
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:2379/health | grep -q '\"health\":\"true\"'"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  # ── Orders DB cluster ──────────────────────────────────────────────────────
+  # Two Patroni-managed PostgreSQL nodes; etcd elects one as primary.
+  # Node naming is neutral (db-1 / db-2); either can hold the primary role.
+  order-db-1:
+    build: ./patroni
+    environment:
+      PATRONI_NAME: order-db-1
+      PATRONI_SCOPE: order-cluster
+      PATRONI_ETCD_HOST: etcd
+      PATRONI_ETCD_PORT: 2379
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: orders
+      REPLICATION_PASSWORD: replicator
+    volumes:
+      - order_db_1_data:/data/patroni
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  order-db-2:
+    build: ./patroni
+    environment:
+      PATRONI_NAME: order-db-2
+      PATRONI_SCOPE: order-cluster
+      PATRONI_ETCD_HOST: etcd
+      PATRONI_ETCD_PORT: 2379
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: orders
+      REPLICATION_PASSWORD: replicator
+    volumes:
+      - order_db_2_data:/data/patroni
+    depends_on:
+      etcd:
+        condition: service_healthy
+      order-db-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  # ── Stock DB cluster ───────────────────────────────────────────────────────
+  stock-db-1:
+    build: ./patroni
+    environment:
+      PATRONI_NAME: stock-db-1
+      PATRONI_SCOPE: stock-cluster
+      PATRONI_ETCD_HOST: etcd
+      PATRONI_ETCD_PORT: 2379
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stocks
+      REPLICATION_PASSWORD: replicator
+    volumes:
+      - stock_db_1_data:/data/patroni
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  stock-db-2:
+    build: ./patroni
+    environment:
+      PATRONI_NAME: stock-db-2
+      PATRONI_SCOPE: stock-cluster
+      PATRONI_ETCD_HOST: etcd
+      PATRONI_ETCD_PORT: 2379
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stocks
+      REPLICATION_PASSWORD: replicator
+    volumes:
+      - stock_db_2_data:/data/patroni
+    depends_on:
+      etcd:
+        condition: service_healthy
+      stock-db-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  # ── Payment DB cluster ─────────────────────────────────────────────────────
+  payment-db-1:
+    build: ./patroni
+    environment:
+      PATRONI_NAME: payment-db-1
+      PATRONI_SCOPE: payment-cluster
+      PATRONI_ETCD_HOST: etcd
+      PATRONI_ETCD_PORT: 2379
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: payments
+      REPLICATION_PASSWORD: replicator
+    volumes:
+      - payment_db_1_data:/data/patroni
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  payment-db-2:
+    build: ./patroni
+    environment:
+      PATRONI_NAME: payment-db-2
+      PATRONI_SCOPE: payment-cluster
+      PATRONI_ETCD_HOST: etcd
+      PATRONI_ETCD_PORT: 2379
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: payments
+      REPLICATION_PASSWORD: replicator
+    volumes:
+      - payment_db_2_data:/data/patroni
+    depends_on:
+      etcd:
+        condition: service_healthy
+      payment-db-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  # ── HAProxy – transparent primary routing ─────────────────────────────────
+  # A single HAProxy instance exposes one port per cluster. It polls Patroni's
+  # /primary REST endpoint (HTTP 200 = leader, 503 = replica) and only routes
+  # traffic to the current primary, making failover transparent to all services.
+  db-haproxy:
+    image: haproxy:2.8-alpine
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "5432:5432"   # orders primary
+      - "5433:5433"   # stock  primary
+      - "5434:5434"   # payment primary
+      - "8404:8404"   # HAProxy stats page
+    depends_on:
+      order-db-1:
+        condition: service_healthy
+      stock-db-1:
+        condition: service_healthy
+      payment-db-1:
+        condition: service_healthy
+    # Healthy once every cluster has at least one node answering /primary.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >
+          (curl -sf http://order-db-1:8008/primary || curl -sf http://order-db-2:8008/primary) &&
+          (curl -sf http://stock-db-1:8008/primary || curl -sf http://stock-db-2:8008/primary) &&
+          (curl -sf http://payment-db-1:8008/primary || curl -sf http://payment-db-2:8008/primary)
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # ── Kafka ──────────────────────────────────────────────────────────────────
   kafka:
     image: apache/kafka:latest
     healthcheck:
@@ -145,4 +276,11 @@ services:
       - kafka_data:/var/lib/kafka/data
 
 volumes:
+  etcd_data:
+  order_db_1_data:
+  order_db_2_data:
+  stock_db_1_data:
+  stock_db_2_data:
+  payment_db_1_data:
+  payment_db_2_data:
   kafka_data:
