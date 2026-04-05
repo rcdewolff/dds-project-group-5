@@ -78,7 +78,17 @@ def init_db():
                     total_cost INTEGER NOT NULL
                 )
             """)
-            # rest of your app tables
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS event_log (
+                    correlation_id TEXT   PRIMARY KEY,
+                    event_type     TEXT   NOT NULL,
+                    service        TEXT   NOT NULL,
+                    topic          TEXT   NOT NULL,
+                    kafka_offset   BIGINT NOT NULL,
+                    payload        JSONB  NOT NULL,
+                    received_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             conn.commit()
 
 
