@@ -32,7 +32,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/routes', timeout=2).read()",
+          "import socket; s=socket.create_connection(('127.0.0.1',5000),2); s.close()",
         ]
       interval: 10s
       timeout: 5s
@@ -92,7 +92,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/items', timeout=2).read()",
+          "import socket; s=socket.create_connection(('127.0.0.1',5000),2); s.close()",
         ]
       interval: 10s
       timeout: 5s
@@ -151,7 +151,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/users', timeout=2).read()",
+          "import socket; s=socket.create_connection(('127.0.0.1',5000),2); s.close()",
         ]
       interval: 10s
       timeout: 5s
@@ -206,7 +206,6 @@ services:
       timeout: 10s
       retries: 10
       start_period: 30s
-    container_name: kafka
     ports:
       - "9092:9092"
     environment:
