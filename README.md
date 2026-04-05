@@ -2,13 +2,23 @@
 
 The main branch of this repository contains both a 2PC and SAGA implementation.
 
-Command to run SAGA version:
+Command to run SAGA/2pc version (different machine strengths):
 
 ```bash
-docker compose -f saga/docker-compose.yml up --build
+docker compose -f saga/docker-compose.small.yml up -d --build --wait
+
+docker compose -f saga/docker-compose.50cpu.yml up -d --build --wait
+
+docker compose -f saga/docker-compose.90cpu.yml up -d --build --wait
+
+docker compose -f 2pc/docker-compose.small.yml up -d --build --wait
+
+docker compose -f 2pc/docker-compose.50cpu.yml up -d --build --wait
+
+docker compose -f 2pc/docker-compose.90cpu.yml up -d --build --wait
 ```
 
-Command to shut down SAGA version:
+Command to shut down SAGA/2pc version (replace saga with 2pc for 2pc):
 
 ```bash
 docker compose -f saga/docker-compose.yml down
@@ -21,27 +31,6 @@ docker compose -f saga/docker-compose.yml down -v --rmi local
 
 # Also remove volumes and all images
 docker compose -f saga/docker-compose.yml down -v --rmi all
-```
-
-Command to run 2PC version:
-
-```bash
-docker compose -f 2pc/docker-compose.yml up --build
-```
-
-Command to shut down 2PC version:
-
-```bash
-docker compose -f 2pc/docker-compose.yml down
-
-# Also remove volumes
-docker compose -f 2pc/docker-compose.yml down -v
-
-# Also remove volumes and service images
-docker compose -f 2pc/docker-compose.yml down -v --rmi local
-
-# Also remove volumes and all images
-docker compose -f 2pc/docker-compose.yml down -v --rmi all
 ```
 
 ## Note on 2PC commit history
