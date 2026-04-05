@@ -23,9 +23,10 @@ Client → Order Service → Coordinator → [Stock Service, Payment Service]
                     Success/Failure Response
 ```
 
-## Coordinator Implementation
+## Orchestrator Implementation
 
-The coordinator is implemented in [`coordinator/app.py`](coordinator/app.py) as the `TwoPhaseCommitCoordinator` class.
+The orchestrator is implemented in [`coordinator/app.py`](coordinator/app.py) as the `Orchestrator` class.
+It is intentionally service-agnostic: concrete participants are supplied by the caller as `Participant` objects, and any domain side-effect (for this project: marking an order as paid) is injected from Order via `on_commit_decided`.
 
 ### Key Components
 
@@ -57,7 +58,7 @@ This encapsulates all the information needed to communicate with each service du
 
 ### The 2PC Protocol Flow
 
-The coordinator's `run()` method implements the full 2PC protocol:
+The orchestrator's `run()` method implements the full 2PC protocol:
 
 #### Phase 1: Prepare Phase
 
@@ -280,8 +281,8 @@ Location: [`order/app.py`](order/app.py) - `/checkout/<order_id>` endpoint
 
 4. **Execute 2PC Protocol**
    ```python
-   result = coordinator.run(order_id=order_id,
-                           participants=[stock_participant, payment_participant])
+    result = orchestrator.run(business_id=order_id,
+                                      participants=[stock_participant, payment_participant])
    ```
 
 5. **Handle Result**
@@ -297,12 +298,12 @@ Location: [`order/app.py`](order/app.py) - `/checkout/<order_id>` endpoint
 
 ## Database Persistence for Durability
 
-The coordinator persists transaction state to a PostgreSQL database:
+The orchestrator persists transaction state to a PostgreSQL database:
 
 ```sql
-CREATE TABLE order_transactions (
+CREATE TABLE orchestrator_transactions (
     transaction_id TEXT PRIMARY KEY,
-    order_id       TEXT NOT NULL,
+    business_id    TEXT NOT NULL,
     status         TEXT NOT NULL DEFAULT 'INITIATED',
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )

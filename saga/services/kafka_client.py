@@ -26,7 +26,11 @@ class Client:
             bootstrap_servers=self.bootstrap_servers,
             group_id=f'{self.service_name}-group',
             auto_offset_reset='earliest',
-            enable_auto_commit=True
+            enable_auto_commit=True,
+            # Broker responds within 10ms even on sparse partitions (default 500ms).
+            fetch_max_wait_ms=10,
+            # Fetch up to 500 records per poll to drain backlogs faster.
+            max_poll_records=500,
         )
 
         print("Kafka client started and subscribed to topics: ",topics_to_watch)

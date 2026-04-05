@@ -1,6 +1,11 @@
+name: checkout-90cpu
+
 services:
   gateway:
     image: nginx:1.25-bookworm
+    cpus: "4.0"
+    deploy:
+      replicas: 1
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -20,6 +25,9 @@ services:
       - ./order:/home/flask-app/
       - ./services:/home/flask-app/services
     image: order:latest
+    cpus: "2.0"
+    deploy:
+      replicas: 8
     healthcheck:
       test:
         [
@@ -53,6 +61,9 @@ services:
       - ./order:/home/flask-app/
       - ./services:/home/flask-app/services
     image: order:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 8
     command: uvicorn checkout_worker:app --host 0.0.0.0 --port 8001 --workers 1
     environment:
       - CHECKOUT_MAX_INFLIGHT=1000
@@ -71,12 +82,13 @@ services:
 
   order-consumer:
     build: ./order
-    deploy:
-      replicas: 1
     volumes:
       - ./order:/home/flask-app/
       - ./services:/home/flask-app/services
     image: order:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 10
     environment:
       - PYTHONUNBUFFERED=1
       - INIT_DB=false
@@ -101,6 +113,9 @@ services:
       - ./order:/home/flask-app/
       - ./services:/home/flask-app/services
     image: order:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 2
     environment:
       - PYTHONUNBUFFERED=1
       - OUTBOX_POLL_INTERVAL=0.002
@@ -135,8 +150,10 @@ services:
     ports:
       - "5432:5432"
     deploy:
+      replicas: 1
       resources:
         limits:
+          cpus: "4.0"
           memory: 1G
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -155,6 +172,9 @@ services:
       - ./stock:/home/flask-app/
       - ./services:/home/flask-app/services
     image: stock:latest
+    cpus: "2.0"
+    deploy:
+      replicas: 5
     healthcheck:
       test:
         [
@@ -181,8 +201,6 @@ services:
 
   stock-consumer:
     build: ./stock
-    deploy:
-      replicas: 1
     environment:
       - PYTHONUNBUFFERED=1
       - INIT_DB=false
@@ -191,6 +209,9 @@ services:
       - ./stock:/home/flask-app/
       - ./services:/home/flask-app/services
     image: stock:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 6
     command: python consumer.py
     env_file:
       - env/stock_citus.env
@@ -211,6 +232,9 @@ services:
       - ./stock:/home/flask-app/
       - ./services:/home/flask-app/services
     image: stock:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 2
     environment:
       - PYTHONUNBUFFERED=1
       - OUTBOX_POLL_INTERVAL=0.002
@@ -244,8 +268,10 @@ services:
     ports:
       - "5433:5432"
     deploy:
+      replicas: 1
       resources:
         limits:
+          cpus: "3.0"
           memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -262,6 +288,9 @@ services:
       - ./payment:/home/flask-app/
       - ./services:/home/flask-app/services
     image: payment:latest
+    cpus: "2.0"
+    deploy:
+      replicas: 5
     healthcheck:
       test:
         [
@@ -290,12 +319,13 @@ services:
 
   payment-consumer:
     build: ./payment
-    deploy:
-      replicas: 1
     volumes:
       - ./payment:/home/flask-app/
       - ./services:/home/flask-app/services
     image: payment:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 6
     command: python consumer.py
     environment:
       - PYTHONUNBUFFERED=1
@@ -320,6 +350,9 @@ services:
       - ./payment:/home/flask-app/
       - ./services:/home/flask-app/services
     image: payment:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 2
     command: python producer.py
     environment:
       - PYTHONUNBUFFERED=1
@@ -337,6 +370,7 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+
   payment-citus-db:
     image: citusdata/citus:13.0
     environment:
@@ -352,8 +386,10 @@ services:
     ports:
       - "5434:5432"
     deploy:
+      replicas: 1
       resources:
         limits:
+          cpus: "3.0"
           memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -366,6 +402,9 @@ services:
   # ---------------------------------------------------------------------------
   kafka:
     image: apache/kafka:latest
+    cpus: "3.0"
+    deploy:
+      replicas: 1
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
       interval: 10s
@@ -391,12 +430,15 @@ services:
 
   kafka-init:
     image: apache/kafka:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 1
     command: ["/bin/sh", "/scripts/create-kafka-topics.sh"]
     volumes:
       - ./scripts:/scripts:ro
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_APP_TOPIC_PARTITIONS=6
+      - KAFKA_APP_TOPIC_PARTITIONS=24
       - KAFKA_APP_TOPIC_REPLICATION_FACTOR=1
     depends_on:
       kafka:

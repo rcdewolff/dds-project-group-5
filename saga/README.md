@@ -1,7 +1,20 @@
 # Distributed Data Systems Project Template
 
-Basic project structure with Python's Flask and Redis. 
-**You are free to use any web framework in any language and any database you like for this project.**
+Saga-critical communication is implemented with Kafka and database-backed Inbox/Outbox reliability.
+Redis is optional and not used in the saga-critical checkout progression path.
+
+## Persistence model
+
+The Saga implementation now uses conventional current-state relational tables as the source of truth:
+
+- Payment service stores user balances in `accounts`.
+- Stock service stores item stock/price in `inventory`.
+- Order service stores business state in `orders` and saga progression state in `sagas`.
+
+Inbox and Outbox tables are preserved in all services for idempotent consumption and reliable Kafka publication.
+
+Legacy `log`/`*_snapshots` tables are not used as primary domain state anymore and are no longer created by
+service startup logic.
 
 ### Project structure
 
@@ -32,6 +45,26 @@ Basic project structure with Python's Flask and Redis.
 
 After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct
 (you can use the provided tests in the `\test` folder and change them as you wish). 
+
+The compose setup includes:
+- `kafka-init`: manually creates application topics (`stock.request`, `payment.request`, `order.request`, `checkout-commands`, `checkout-results`) with 6 partitions and replication factor 1
+- dedicated `*-consumer` and `*-producer` containers for Kafka consumption and outbox publication
+- `order-checkout-worker` (Uvicorn/FastAPI) as the async HTTP worker for `/orders/checkout/*`
+
+Checkout worker flow (Kafka waiter):
+- `POST /orders/checkout/{order_id}` generates `correlation_id`, registers local waiter, and emits `checkout.command` to Kafka topic `checkout-commands`
+- order consumer starts the saga using the command `correlation_id`
+- order checkout workflow supplies the concrete saga steps and routing targets to `order/orchestrator.py`; the orchestrator only persists state, dispatches the provided step messages, and reports terminal completion/failure back to `checkout-results`
+- checkout-worker waits in-memory for a matching terminal event from Kafka topic `checkout-results`
+- terminal `completed` returns HTTP 200; terminal `failed`/`compensated` returns HTTP 400
+- request remains open until terminal result arrives (no polling, no 202/504 timeout response)
+
+Checkout worker env vars:
+- `CHECKOUT_MAX_INFLIGHT`
+- `KAFKA_BOOTSTRAP_SERVERS`
+- `CHECKOUT_COMMANDS_TOPIC`
+- `CHECKOUT_RESULTS_TOPIC`
+- `CHECKOUT_WORKER_GROUP_ID` (base id; worker appends host/pid for per-process uniqueness)
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 

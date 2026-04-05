@@ -10,6 +10,7 @@ from enum import Enum
 from typing import Any, Callable
 
 import psycopg
+from psycopg import sql
 import requests
 
 logger = logging.getLogger(__name__)
@@ -48,22 +49,22 @@ class Participant:
 
 
 @dataclass
-class CoordinatorResult:
+class OrchestratorResult:
     transaction_id: str
     success:        bool
     error:          str | None = None
 
     @classmethod
-    def ok(cls, transaction_id: str) -> "CoordinatorResult":
+    def ok(cls, transaction_id: str) -> "OrchestratorResult":
         return cls(transaction_id=transaction_id, success=True)
 
     @classmethod
-    def failure(cls, transaction_id: str, error: str) -> "CoordinatorResult":
+    def failure(cls, transaction_id: str, error: str) -> "OrchestratorResult":
         return cls(transaction_id=transaction_id, success=False, error=error)
 
 
-class TwoPhaseCommitCoordinator:
-    """Durable 2PC coordinator.
+class Orchestrator:
+    """Durable, reusable 2PC orchestrator.
 
     Correctness invariants
     ----------------------
@@ -77,16 +78,26 @@ class TwoPhaseCommitCoordinator:
        returns ABORTED (presumed-abort rule).
     """
 
-    def __init__(self, db_pool, timeout: int = 10):
+    def __init__(
+        self,
+        db_pool,
+        timeout: int = 10,
+        transaction_table: str = "orchestrator_transactions",
+        participant_table: str = "orchestrator_tx_participants",
+        on_commit_decided: Callable[[Any, str], None] | None = None,
+    ):
         self.db_pool = db_pool
         self.timeout = timeout
+        self.transaction_table = transaction_table
+        self.participant_table = participant_table
+        self.on_commit_decided = on_commit_decided
 
     # ── public API ─────────────────────────────────────────────────────────
 
-    def run(self, order_id: str, participants: list[Participant]) -> CoordinatorResult:
-        """Drive a full 2PC round.  Never raises – returns CoordinatorResult."""
+    def run(self, business_id: str, participants: list[Participant]) -> OrchestratorResult:
+        """Drive a full 2PC round. Never raises – returns OrchestratorResult."""
         transaction_id = str(uuid.uuid4())
-        logger.debug("2PC START  tx=%s  order=%s", transaction_id, order_id)
+        logger.debug("2PC START  tx=%s  business_id=%s", transaction_id, business_id)
 
         # ── Phase 1: Prepare (parallel) ──
         votes: dict[str, PrepareVote] = {}
@@ -114,7 +125,7 @@ class TwoPhaseCommitCoordinator:
             if prepared:
                 # Durably persist ABORT_DECIDED *before* sending any abort msgs
                 if self._persist_decision(
-                    transaction_id, order_id, TxStatus.ABORT_DECIDED, prepared
+                    transaction_id, business_id, TxStatus.ABORT_DECIDED, prepared
                 ):
                     self._disseminate_aborts(transaction_id, prepared)
                 else:
@@ -122,7 +133,7 @@ class TwoPhaseCommitCoordinator:
                     # resolve via inquiry (presumed abort) eventually.
                     self._best_effort_abort(transaction_id, prepared)
 
-            return CoordinatorResult.failure(
+            return OrchestratorResult.failure(
                 transaction_id, f"Prepare failed for: {failed}"
             )
 
@@ -131,22 +142,22 @@ class TwoPhaseCommitCoordinator:
 
         if not to_commit:
             # All read-only – nothing to persist or commit
-            return CoordinatorResult.ok(transaction_id)
+            return OrchestratorResult.ok(transaction_id)
 
         # === COMMIT path ===
-        # Force-write COMMIT_DECIDED + participant list + orders.paid
+        # Force-write COMMIT_DECIDED + participant list (+ optional commit hook)
         if not self._persist_decision(
-            transaction_id, order_id, TxStatus.COMMIT_DECIDED, to_commit
+            transaction_id, business_id, TxStatus.COMMIT_DECIDED, to_commit
         ):
             # Cannot persist commit → must abort
             # Try to durably record abort; if that also fails, best-effort.
             if self._persist_decision(
-                transaction_id, order_id, TxStatus.ABORT_DECIDED, to_commit
+                transaction_id, business_id, TxStatus.ABORT_DECIDED, to_commit
             ):
                 self._disseminate_aborts(transaction_id, to_commit)
             else:
                 self._best_effort_abort(transaction_id, to_commit)
-            return CoordinatorResult.failure(
+            return OrchestratorResult.failure(
                 transaction_id, "Failed to persist commit decision"
             )
 
@@ -157,7 +168,7 @@ class TwoPhaseCommitCoordinator:
         self._disseminate_commits(transaction_id, to_commit)
 
         logger.debug("2PC COMMITTED  tx=%s", transaction_id)
-        return CoordinatorResult.ok(transaction_id)
+        return OrchestratorResult.ok(transaction_id)
 
     def get_transaction_status(self, transaction_id: str) -> str:
         """Inquiry protocol – participants poll this to resolve uncertain txns.
@@ -169,7 +180,9 @@ class TwoPhaseCommitCoordinator:
             with self.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT status FROM order_transactions WHERE transaction_id = %s",
+                        sql.SQL("SELECT status FROM {} WHERE transaction_id = %s").format(
+                            sql.Identifier(self.transaction_table)
+                        ),
                         (transaction_id,),
                     )
                     row = cur.fetchone()
@@ -190,9 +203,9 @@ class TwoPhaseCommitCoordinator:
     ) -> int:
         """Resume every incomplete txn.  Called on startup **and** periodically.
 
-        ``participant_factory(transaction_id, participant_name) → Participant``
+        ``participant_factory(transaction_id, participant_name) -> Participant``
         must reconstruct a :class:`Participant` from just the name (the
-        coordinator only persists participant names, not full URLs, because
+        orchestrator only persists participant names, not full URLs, because
         those depend on the runtime ``GATEWAY_URL``).
 
         Returns the count of transactions that still have un-ACK'd
@@ -352,13 +365,18 @@ class TwoPhaseCommitCoordinator:
             with self.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """
-                        SELECT t.transaction_id, p.participant_name
-                        FROM order_transactions t
-                        JOIN tx_participants p
-                          ON t.transaction_id = p.transaction_id
-                        WHERE t.status = %s AND p.acked = FALSE
-                        """,
+                        sql.SQL(
+                            """
+                            SELECT t.transaction_id, p.participant_name
+                            FROM {transactions} t
+                            JOIN {participants} p
+                              ON t.transaction_id = p.transaction_id
+                            WHERE t.status = %s AND p.acked = FALSE
+                            """
+                        ).format(
+                            transactions=sql.Identifier(self.transaction_table),
+                            participants=sql.Identifier(self.participant_table),
+                        ),
                         (in_progress_status.value,),
                     )
                     rows = cur.fetchall()
@@ -393,45 +411,45 @@ class TwoPhaseCommitCoordinator:
     def _persist_decision(
         self,
         transaction_id: str,
-        order_id: str,
+        business_id: str,
         status: TxStatus,
         participants: list[Participant],
     ) -> bool:
         """Atomically persist decision + participant list.
 
-        For COMMIT_DECIDED this also sets ``orders.paid = TRUE`` so that the
-        order is immediately visible as paid once the decision is durable.
+        Optional business side-effects can be injected via ``on_commit_decided``.
         """
         try:
             with self.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """
-                        INSERT INTO order_transactions
-                               (transaction_id, order_id, status)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (transaction_id)
-                        DO UPDATE SET status = EXCLUDED.status
-                        """,
-                        (transaction_id, order_id, status.value),
+                        sql.SQL(
+                            """
+                            INSERT INTO {transactions}
+                                   (transaction_id, business_id, status)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (transaction_id)
+                            DO UPDATE SET status = EXCLUDED.status
+                            """
+                        ).format(transactions=sql.Identifier(self.transaction_table)),
+                        (transaction_id, business_id, status.value),
                         prepare=False,
                     )
                     for p in participants:
                         cur.execute(
-                            """
-                            INSERT INTO tx_participants
-                                   (transaction_id, participant_name, acked)
-                            VALUES (%s, %s, FALSE)
-                            ON CONFLICT (transaction_id, participant_name)
-                            DO NOTHING
-                            """,
+                            sql.SQL(
+                                """
+                                INSERT INTO {participants}
+                                       (transaction_id, participant_name, acked)
+                                VALUES (%s, %s, FALSE)
+                                ON CONFLICT (transaction_id, participant_name)
+                                DO NOTHING
+                                """
+                            ).format(participants=sql.Identifier(self.participant_table)),
                             (transaction_id, p.name),
                         )
-                    if status == TxStatus.COMMIT_DECIDED:
-                        cur.execute(
-                            "UPDATE orders SET paid = TRUE WHERE order_id = %s",
-                            (order_id,),
-                        )
+                    if status == TxStatus.COMMIT_DECIDED and self.on_commit_decided:
+                        self.on_commit_decided(cur, business_id)
                     conn.commit()
             return True
         except psycopg.Error as exc:
@@ -446,10 +464,12 @@ class TwoPhaseCommitCoordinator:
             with self.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """
-                        UPDATE tx_participants SET acked = TRUE
-                        WHERE transaction_id = %s AND participant_name = %s
-                        """,
+                        sql.SQL(
+                            """
+                            UPDATE {participants} SET acked = TRUE
+                            WHERE transaction_id = %s AND participant_name = %s
+                            """
+                        ).format(participants=sql.Identifier(self.participant_table)),
                         (transaction_id, participant_name),
                     )
                     conn.commit()
@@ -464,10 +484,12 @@ class TwoPhaseCommitCoordinator:
             with self.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """
-                        SELECT COUNT(*) FROM tx_participants
-                        WHERE transaction_id = %s AND acked = FALSE
-                        """,
+                        sql.SQL(
+                            """
+                            SELECT COUNT(*) FROM {participants}
+                            WHERE transaction_id = %s AND acked = FALSE
+                            """
+                        ).format(participants=sql.Identifier(self.participant_table)),
                         (transaction_id,),
                     )
                     return cur.fetchone()[0] == 0
@@ -480,7 +502,9 @@ class TwoPhaseCommitCoordinator:
             with self.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE order_transactions SET status = %s WHERE transaction_id = %s",
+                        sql.SQL("UPDATE {} SET status = %s WHERE transaction_id = %s").format(
+                            sql.Identifier(self.transaction_table)
+                        ),
                         (final_status.value, transaction_id),
                     )
                     conn.commit()
@@ -489,3 +513,8 @@ class TwoPhaseCommitCoordinator:
                 "Failed to finalize  tx=%s  status=%s  exc=%s",
                 transaction_id, final_status, exc,
             )
+
+
+# Backward-compatible aliases for existing imports.
+TwoPhaseCommitCoordinator = Orchestrator
+CoordinatorResult = OrchestratorResult

@@ -18,7 +18,7 @@ from flask import Flask, jsonify, abort, Response, request
 from kafka_service import kafka_client
 from kafka_service.kafka_event import BaseEvent, OrderPayload, CheckoutPayload
 from kafka_service.consumer_handler import EventConsumer
-from coordinator import TwoPhaseCommitCoordinator, Participant
+from coordinator import Orchestrator, Participant, create_tables
 from coordinator.app import RECONCILE_INTERVAL
 
 DB_ERROR_STR = "DB error"
@@ -51,15 +51,23 @@ db_pool = ConnectionPool(
 )
 
 event_consumer = EventConsumer(kafka_consumer, db_pool, service_name)
-coordinator    = TwoPhaseCommitCoordinator(db_pool, timeout=10)
+
+
+def _mark_order_paid(cur, order_id: str) -> None:
+    cur.execute("UPDATE orders SET paid = TRUE WHERE order_id = %s", (order_id,))
+
+
+orchestrator = Orchestrator(db_pool, timeout=10, on_commit_decided=_mark_order_paid)
 
 
 # ---------------------------------------------------------------------------
 # DB init
 # ---------------------------------------------------------------------------
 
+
 def init_db():
     with db_pool.connection() as conn:
+        create_tables(conn)  # ← orchestrator handles its own schema
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
@@ -68,22 +76,6 @@ def init_db():
                     items      JSONB   NOT NULL,
                     user_id    TEXT    NOT NULL,
                     total_cost INTEGER NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS order_transactions (
-                    transaction_id TEXT PRIMARY KEY,
-                    order_id       TEXT NOT NULL,
-                    status         TEXT NOT NULL,
-                    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS tx_participants (
-                    transaction_id  TEXT    NOT NULL,
-                    participant_name TEXT   NOT NULL,
-                    acked           BOOLEAN NOT NULL DEFAULT FALSE,
-                    PRIMARY KEY (transaction_id, participant_name)
                 )
             """)
             cur.execute("""
@@ -128,7 +120,7 @@ def _reconciler_loop():
     while True:
         time.sleep(RECONCILE_INTERVAL)
         try:
-            remaining = coordinator.reconcile(_build_participant)
+            remaining = orchestrator.reconcile(_build_participant)
             if remaining:
                 logging.info("Reconciler: %d txns still incomplete", remaining)
         except Exception as exc:
@@ -139,7 +131,7 @@ def start_reconciler():
     """Start the background reconciler and run one immediate sweep."""
     # Immediate recovery sweep on startup
     try:
-        remaining = coordinator.reconcile(_build_participant)
+        remaining = orchestrator.reconcile(_build_participant)
         if remaining:
             logging.info("Startup recovery: %d txns still incomplete", remaining)
     except Exception as exc:
@@ -292,8 +284,8 @@ def checkout(order_id: str):
                       'amount': order_entry.total_cost},
     )
 
-    result = coordinator.run(order_id=order_id,
-                             participants=[stock_participant, payment_participant])
+    result = orchestrator.run(business_id=order_id,
+                              participants=[stock_participant, payment_participant])
 
     if not result.success:
         kafka_producer.send(topic="order.events", value=BaseEvent.create(
@@ -317,7 +309,7 @@ def checkout(order_id: str):
 @app.get('/transaction/<transaction_id>/status')
 def transaction_status(transaction_id: str):
     """Participant inquiry protocol — participants poll to resolve uncertain txs."""
-    status = coordinator.get_transaction_status(transaction_id)
+    status = orchestrator.get_transaction_status(transaction_id)
     return jsonify({'transaction_id': transaction_id, 'status': status}), 200
 
 if __name__ == '__main__':
