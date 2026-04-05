@@ -1,0 +1,45 @@
+List of contributions to the DDS project - Group 5
+
+Our work division strategy (individual contributions listed below):
+
+In phase 1, we split the work in a way where two people would work on the 2PC implementation (Adithya and Raphael), 
+and two others would work on the SAGA implementation (Francesco and Arthur).
+In phase 2, besides implementing the orchestrator, we thought most of the work should happen in improving the SAGA implementation. 
+We thought of two main strategies to continue with the SAGA implementation, and decided to split the work based on these strategies. 
+Francesco and Arthur would continue with 1 strategy, Adithya and Raphael with the other. 
+The better strategy is then submitted in the end. 
+This way there is some duplicate work, but all of us get a lot of experience with different parts of the project and learn a lot.
+
+Individual contributions:
+
+Name: Raphael
+Surname: De Wolff
+Student number: 5566487
+TUD email: r.c.dewolff@student.tudelft.nl
+Contributions:
+Phase 1: Contributed to the 2PC implementation.
+Phase 2: Worked on the ‘non-redis pub/sub’ strategy for improving SAGA, and worked on separating orchestrator class in SAGA.
+
+Name: Francesco
+Surname: Carboni
+Student number: 6538924 
+TUD email: F.carboni@student.tudelft.nl 
+Contributions:
+Phase 1: Contributed to SAGA implementation.
+Phase 2: Worked on the redis pub-sub strategy, and abstracted orchestrator and worked on partitioning for SAGA.
+
+Name:Adithya		
+Surname: Murali
+Student number: 6510612
+TUD email:a.murali-2@student.tudelft.nl
+Contributions:
+Phase 1: Worked on the implementation of 2PC
+Phase 2: Abstracted out the coordinator as an orchestrator for 2PC and worked on the implementation and optimization of “non-redis pub/sub” strategy for SAGA.
+
+Name: Arthur
+Surname: Truetzschler von Falkenstein
+Student number: 4959620	
+TUD email: m.a.trutzschlervonfalkenstein@student.tudelft.nl	
+Contributions:
+Phase 1: Contributed to the saga implementation
+Phase 2: Contributed to the redis pub/sub implementation for saga, specifically a version with an alternative the inbox/outbox pattern.

@@ -89,7 +89,6 @@ def init_db():
                     received_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # rest of your app tables
             conn.commit()
 
 

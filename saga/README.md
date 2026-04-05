@@ -54,6 +54,7 @@ The compose setup includes:
 Checkout worker flow (Kafka waiter):
 - `POST /orders/checkout/{order_id}` generates `correlation_id`, registers local waiter, and emits `checkout.command` to Kafka topic `checkout-commands`
 - order consumer starts the saga using the command `correlation_id`
+- order checkout workflow supplies the concrete saga steps and routing targets to `order/orchestrator.py`; the orchestrator only persists state, dispatches the provided step messages, and reports terminal completion/failure back to `checkout-results`
 - checkout-worker waits in-memory for a matching terminal event from Kafka topic `checkout-results`
 - terminal `completed` returns HTTP 200; terminal `failed`/`compensated` returns HTTP 400
 - request remains open until terminal result arrives (no polling, no 202/504 timeout response)
