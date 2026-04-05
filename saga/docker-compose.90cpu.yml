@@ -1,0 +1,448 @@
+name: checkout-90cpu
+
+services:
+  gateway:
+    image: nginx:1.25-bookworm
+    cpus: "4.0"
+    deploy:
+      replicas: 1
+    volumes:
+      - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:80"
+    depends_on:
+      - order-checkout-worker
+      - order-service
+      - stock-service
+      - payment-service
+
+  # ---------------------------------------------------------------------------
+  # Order Service
+  # ---------------------------------------------------------------------------
+  order-service:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    cpus: "2.0"
+    deploy:
+      replicas: 8
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/routes', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    environment:
+      - GATEWAY_URL=http://gateway:80
+      - PYTHONUNBUFFERED=1
+    command: gunicorn -b 0.0.0.0:5000 -w 4 -k uvicorn.workers.UvicornWorker --timeout 60 --config gunicorn.conf.py app:app
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  order-checkout-worker:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 8
+    command: uvicorn checkout_worker:app --host 0.0.0.0 --port 8001 --workers 1
+    environment:
+      - CHECKOUT_MAX_INFLIGHT=1000
+      - CHECKOUT_COMMANDS_TOPIC=checkout-commands
+      - CHECKOUT_RESULTS_TOPIC=checkout-results
+      - CHECKOUT_WORKER_GROUP_ID=checkout-worker
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-service:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  order-consumer:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 10
+    environment:
+      - PYTHONUNBUFFERED=1
+      - INIT_DB=false
+      - DB_POOL_MAX_SIZE=4
+    command: python consumer.py
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-citus-db:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  order-producer:
+    build: ./order
+    volumes:
+      - ./order:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: order:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 2
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OUTBOX_POLL_INTERVAL=0.002
+      - OUTBOX_FETCH_BATCH_SIZE=100
+      - RELAY_WORKERS=2
+    command: python producer.py
+    env_file:
+      - env/order_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      order-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  order-citus-db:
+    image: citusdata/citus:13.0
+    command: >
+      postgres
+      -c ssl=off
+      -c max_connections=200
+      -c shared_buffers=512MB
+      -c work_mem=4MB
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=orders
+    ports:
+      - "5432:5432"
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Stock Service
+  # ---------------------------------------------------------------------------
+  stock-service:
+    build: ./stock
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./stock:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: stock:latest
+    cpus: "2.0"
+    deploy:
+      replicas: 5
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/items', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 60 --config gunicorn.conf.py app:app
+    env_file:
+      - env/stock_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      stock-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  stock-consumer:
+    build: ./stock
+    environment:
+      - PYTHONUNBUFFERED=1
+      - INIT_DB=false
+      - DB_POOL_MAX_SIZE=4
+    volumes:
+      - ./stock:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: stock:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 6
+    command: python consumer.py
+    env_file:
+      - env/stock_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      stock-citus-db:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  stock-producer:
+    build: ./stock
+    volumes:
+      - ./stock:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: stock:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 2
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OUTBOX_POLL_INTERVAL=0.002
+      - OUTBOX_FETCH_BATCH_SIZE=100
+    command: python producer.py
+    env_file:
+      - env/stock_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      stock-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  stock-citus-db:
+    image: citusdata/citus:13.0
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=stocks
+    command: >
+      postgres
+      -c ssl=off
+      -c max_connections=100
+      -c shared_buffers=128MB
+      -c work_mem=2MB
+    ports:
+      - "5433:5432"
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "3.0"
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Payment Service
+  # ---------------------------------------------------------------------------
+  payment-service:
+    build: ./payment
+    volumes:
+      - ./payment:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: payment:latest
+    cpus: "2.0"
+    deploy:
+      replicas: 5
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/users', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command: gunicorn -b 0.0.0.0:5000 -w 2 -k uvicorn.workers.UvicornWorker --timeout 60 --config gunicorn.conf.py app:app
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - env/payment_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      payment-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  payment-consumer:
+    build: ./payment
+    volumes:
+      - ./payment:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: payment:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 6
+    command: python consumer.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - INIT_DB=false
+      - DB_POOL_MAX_SIZE=4
+    env_file:
+      - env/payment_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      payment-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      payment-service:
+        condition: service_healthy
+
+  payment-producer:
+    build: ./payment
+    volumes:
+      - ./payment:/home/flask-app/
+      - ./services:/home/flask-app/services
+    image: payment:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 2
+    command: python producer.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OUTBOX_POLL_INTERVAL=0.002
+      - OUTBOX_FETCH_BATCH_SIZE=100
+    env_file:
+      - env/payment_citus.env
+      - env/kafka_settings.env
+    depends_on:
+      payment-citus-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  payment-citus-db:
+    image: citusdata/citus:13.0
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=payments
+    command: >
+      postgres
+      -c ssl=off
+      -c max_connections=100
+      -c shared_buffers=128MB
+      -c work_mem=2MB
+    ports:
+      - "5434:5432"
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "3.0"
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Kafka
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:latest
+    cpus: "3.0"
+    deploy:
+      replicas: 1
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  kafka-init:
+    image: apache/kafka:latest
+    cpus: "1.0"
+    deploy:
+      replicas: 1
+    command: ["/bin/sh", "/scripts/create-kafka-topics.sh"]
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_APP_TOPIC_PARTITIONS=24
+      - KAFKA_APP_TOPIC_REPLICATION_FACTOR=1
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+volumes:
+  kafka_data:
