@@ -207,7 +207,7 @@ async def main() -> None:
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             group_id="stock-consumer-group",
             auto_offset_reset="earliest",
-            enable_auto_commit=True,
+            enable_auto_commit=False,
             fetch_max_wait_ms=10,
             max_poll_records=500,
         )
@@ -226,6 +226,7 @@ async def main() -> None:
                     for msg in msgs
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+                await consumer.commit()
                 for r in results:
                     if isinstance(r, Exception):
                         logger.exception("Stock consumer task failed: %s", r)
