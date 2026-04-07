@@ -57,7 +57,7 @@ def _payload_to_base_event(payload: Any) -> utils.BaseEvent:
 
 async def _cleanup_published(pool: AsyncConnectionPool) -> None:
     try:
-        async with pool.connection() as conn:
+        async with pool.connection(timeout=2.0) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """

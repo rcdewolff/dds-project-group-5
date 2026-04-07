@@ -80,6 +80,8 @@ async def _handle_checkout(
                 "amount": amount,
             }
 
+        await asyncio.sleep(0)
+
     return {"status": "failure", "reason": "version_conflict"}
 
 
@@ -191,6 +193,8 @@ async def main() -> None:
             fetch_max_wait_ms=10,
             max_poll_records=500,
             max_poll_interval_ms=300000,
+            session_timeout_ms=30000,
+            heartbeat_interval_ms=3000,
         )
         await consumer.start()
         logger.info("Payment consumer started")
@@ -198,7 +202,7 @@ async def main() -> None:
         cleanup_task = asyncio.create_task(_cleanup_loop(pool))
         try:
             while True:
-                records = await consumer.getmany(timeout_ms=100, max_records=pool_size * 2)
+                records = await consumer.getmany(timeout_ms=100, max_records=pool_size)
                 if not records:
                     continue
                 tasks = [

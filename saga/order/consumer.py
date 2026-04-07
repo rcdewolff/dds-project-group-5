@@ -325,6 +325,8 @@ async def main() -> None:
             fetch_max_wait_ms=10,
             max_poll_records=500,
             max_poll_interval_ms=300000,
+            session_timeout_ms=60000,
+            heartbeat_interval_ms=1000,
         )
         await consumer.start()
         logger.info("Order consumer started topics=order.request,%s", CHECKOUT_COMMANDS_TOPIC)
@@ -332,7 +334,7 @@ async def main() -> None:
         cleanup_task = asyncio.create_task(_cleanup_loop(pool))
         try:
             while True:
-                records = await consumer.getmany(timeout_ms=100, max_records=pool_size * 2)
+                records = await consumer.getmany(timeout_ms=100, max_records=pool_size)
                 if not records:
                     continue
                 tasks = [

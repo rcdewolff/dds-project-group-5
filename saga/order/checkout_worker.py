@@ -120,11 +120,12 @@ async def _publish_checkout_command(
         "order_id": order_id,
         "timestamp": time.time(),
     }
-    await state.producer.send_and_wait(
+    fut = await state.producer.send(
         CHECKOUT_COMMANDS_TOPIC,
         key=correlation_id.encode("utf-8"),
         value=json.dumps(command_event).encode("utf-8"),
     )
+    await fut
 
 
 async def _consume_checkout_results(state: WorkerState) -> None:
@@ -224,7 +225,7 @@ async def checkout(order_id: str, request: Request):
     state: WorkerState = request.app.state.worker
 
     try:
-        await asyncio.wait_for(state.inflight_semaphore.acquire(), timeout=0.05)
+        await asyncio.wait_for(state.inflight_semaphore.acquire(), timeout=0.5)
     except TimeoutError:
         raise HTTPException(
             status_code=429,
