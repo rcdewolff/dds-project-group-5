@@ -4,6 +4,7 @@ import os
 from collections import defaultdict
 
 from aiokafka import AIOKafkaConsumer
+from aiokafka.errors import CommitFailedError
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -210,6 +211,7 @@ async def main() -> None:
             enable_auto_commit=False,
             fetch_max_wait_ms=10,
             max_poll_records=500,
+            max_poll_interval_ms=300000,
         )
         await consumer.start()
         logger.info("Stock consumer started")
@@ -226,7 +228,10 @@ async def main() -> None:
                     for msg in msgs
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                await consumer.commit()
+                try:
+                    await consumer.commit()
+                except CommitFailedError:
+                    logger.warning("Stock consumer commit failed after rebalance, messages will be replayed")
                 for r in results:
                     if isinstance(r, Exception):
                         logger.exception("Stock consumer task failed: %s", r)
